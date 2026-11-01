@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77,<85"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fima"
+version = "0.1.0"
+description = "Local voice-first personal finance, built one component at a time."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "faster-whisper==1.2.1",
+    "ctranslate2>=4.5,<5",
+    "av>=11,<17",
+    "nvidia-cublas-cu12>=12,<13; sys_platform == 'linux'",
+    "nvidia-cudnn-cu12>=9,<10; sys_platform == 'linux'",
+]
+
+[project.scripts]
+fima = "fima.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

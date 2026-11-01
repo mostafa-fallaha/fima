@@ -1,0 +1,31 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Device recordings and model weights stay local.
+recordings/
+models/
+*.wav
+*.m4a
+*.mp3
+*.aac
+*.flac
+*.ogg
+*.opus
+*.webm
+*.mp4
+*.bin
+*.safetensors
+
+# Local credentials and workspace integration metadata.
+.env
+.env.*
+.agents/
+.aws/
+.codex/
+
+tests/
