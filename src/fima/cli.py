@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fima.extraction import ExtractionError, extract_transactions
+from fima.processing import DEFAULT_MODEL_PATH, ProcessingError, process_audio
 from fima.transcription import TranscriptionError, transcribe_audio
 
 
@@ -43,19 +44,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--captured-at", type=capture_timestamp,
         help="Original capture timestamp with offset; resolves today/yesterday (never processing time).",
     )
+    processing = commands.add_parser(
+        "process", help="Transcribe audio, then propose transactions using a temporary local model."
+    )
+    processing.add_argument("audio", type=Path, help="Path to the recording.")
+    processing.add_argument(
+        "--offline", action="store_true", help="Use only cached Whisper weights; extraction is always offline."
+    )
+    processing.add_argument(
+        "--model-path", type=Path, default=DEFAULT_MODEL_PATH,
+        help="Extraction GGUF file (default: ~/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_M.gguf).",
+    )
+    processing.add_argument(
+        "--captured-at", type=capture_timestamp,
+        help="Original capture timestamp with offset; resolves today/yesterday.",
+    )
     arguments = parser.parse_args(argv)
 
     try:
         if arguments.command == "transcribe":
             output = transcribe_audio(arguments.audio, offline=arguments.offline)
-        else:
+        elif arguments.command == "extract":
             transcript = sys.stdin.read() if arguments.transcript == "-" else arguments.transcript
             proposal = extract_transactions(
                 transcript, model=arguments.model, port=arguments.port,
                 captured_at=arguments.captured_at,
             )
             output = json.dumps(proposal, indent=2, ensure_ascii=False)
-    except (TranscriptionError, ExtractionError, OSError) as error:
+        else:
+            result = process_audio(
+                arguments.audio, offline=arguments.offline, model_path=arguments.model_path,
+                captured_at=arguments.captured_at,
+                progress=lambda message: print(f"fima: {message}", file=sys.stderr, flush=True),
+            )
+            output = json.dumps(result, indent=2, ensure_ascii=False)
+    except (TranscriptionError, ExtractionError, ProcessingError, OSError) as error:
         print(f"fima: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

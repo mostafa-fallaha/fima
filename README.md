@@ -3,6 +3,7 @@
 A local, voice-first personal finance project, built one component at a time.
 The first component turns an English audio file into a transcript on your PC.
 The second proposes transactions from that transcript through local llama.cpp.
+`fima process` connects both stages in one command and manages their GPU lifetimes.
 The eventual flow is Watch → phone queue → PC → review → Firefly III.
 English and USD are the initial scope. Extraction always requires human review.
 
@@ -111,6 +112,8 @@ Use the same project directory so the relative model cache can be found.
   speech, checks the GPU, and runs large-v3 in English transcription mode.
 - `src/fima/extraction.py` calls a local llama.cpp server, validates proposed
   amounts and source quotes, and resolves supported date phrases in Python.
+- `src/fima/processing.py` runs transcription in a child process, then starts
+  and stops a temporary llama.cpp server for extraction.
 - `evals/` contains 20 fabricated transcripts and a model-comparison runner.
 - `src/fima/__main__.py` also allows `python -m fima`.
 - `tests/` exercises error handling and pipeline behavior with runtime stand-ins.
@@ -201,8 +204,8 @@ You can save a transcript using the existing transcription command, then read it
 uv run --offline fima extract - < /tmp/lunch-transcript.txt
 ```
 
-Keeping the two commands separate makes transcription errors easier to distinguish
-from interpretation errors. Use `--port` if your local llama.cpp server uses a
+The standalone commands help distinguish transcription errors from interpretation
+errors. Use `--port` if your local llama.cpp server uses a
 different port, or `--model` if its alias differs from `fima-extractor`.
 
 Amounts are decimal strings checked with `Decimal`, never binary floating point.
@@ -216,12 +219,68 @@ Validation checks structure and some financial constraints; it cannot establish
 that the model understood the transcript correctly. Check the source quote,
 amount, type, currency and description before accepting any proposal.
 
+## 7. Process a recording in one command
+
+With the Python environment and CUDA library path from sections 1–2 configured:
+
+```bash
+uv run --offline fima process /path/to/recording.mp3 --offline
+```
+
+The command uses your existing model at
+`~/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_M.gguf`. It checks that the recording,
+model file and `llama` (or `llama-server`) executable are available before
+starting inference. It never installs a model or changes the original recording.
+
+Whisper transcribes in a separate Python process. That process exits before
+the extraction model starts, releasing its GPU memory. FiMA then starts a
+temporary llama.cpp server on a free port at `127.0.0.1`, waits until its own
+model is ready, and sends the transcript for extraction. The server uses local
+GGUF weights, CUDA0, thinking disabled, and a 4096-token context.
+
+You do not need to start a server manually for `process`. If you started the
+standalone server from section 6, stop it first to free GPU memory. FiMA stops
+only the child processes it creates; it does not stop other applications.
+Each run loads the extraction model again and stops it after success, failure,
+or Ctrl+C. Startup is limited to 180 seconds; inference requests to 120 seconds.
+
+Stage messages go to stderr. On success, stdout contains one complete JSON
+object with `transcript`, `transactions`, `issues`, and `requires_review: true`.
+On failure or interruption, it prints no partial successful JSON and cleans up
+its children. Exit codes remain 0, 1, 2 and 130 as described above.
+Temporary server logs are discarded, and FiMA does not save transcripts/results.
+
+Supply capture time explicitly when the recording says today or yesterday:
+
+```bash
+uv run --offline fima process /path/to/recording.mp3 --offline \
+    --captured-at 2026-11-02T00:30:00+02:00
+```
+
+Use the recording's real capture timestamp and timezone offset. File modification
+time and processing time are not used as substitutes. Omitting capture metadata
+leaves relative dates unresolved for review.
+
+When you download a smaller model, select its local GGUF file:
+
+```bash
+uv run --offline fima process /path/to/recording.mp3 --offline \
+    --model-path /path/to/smaller-model.gguf
+```
+
+The `--offline` after `process` controls Whisper's cached weights. The temporary
+llama.cpp server always runs offline; the first `--offline` belongs to uv.
+The standalone `transcribe` and `extract` commands remain available for checking
+each stage separately. All financial proposals still require manual review.
+
 ## Current validation status
 
 As of 2026-11-02, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 52 standard-library tests pass using
+complete large-v3 weights are present. All 75 standard-library tests pass using
 the project interpreter. These include extraction validation, client error
-handling, CLI behavior, and evaluation scoring. The user confirmed a real recording transcribed
+handling, CLI behavior, evaluation scoring, sequential processing, and cleanup.
+Cleanup tests include real child processes that exit on SIGTERM or require
+SIGKILL after the grace period. The user confirmed a real recording transcribed
 successfully with cached weights after configuring the Fish GPU library path.
 
 Systematic recognition-quality checks and real-silence evaluation remain to be
@@ -237,6 +296,14 @@ the quote instruction did not change that result. The cents/yesterday CLI
 smoke test succeeded. The Qwen3.5-9B/Gemma E2B comparison is still pending:
 model downloads were too slow, and partial transfers were stopped. These are
 limited development results; descriptions still need manual review.
+
+The combined `process` command also succeeded on the user's existing recording
+with cached weights: it returned a transcript, one proposed transaction, and a
+missing-date flag. The audio was unchanged, and the temporary inference
+processes exited with GPU memory released. Private contents were not copied
+into these notes. This smoke test verifies execution, not financial accuracy.
+Interrupting another real run during Qwen startup returned 130, printed no
+partial JSON, and removed the owned server while leaving the audio unchanged.
 
 Use `uv sync --locked` to reproduce dependencies. The pinned faster-whisper
 version and PyAV bound avoid the newer PyAV API change removing
