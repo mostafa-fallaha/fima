@@ -2,8 +2,9 @@
 
 A local, voice-first personal finance project, built one component at a time.
 The first component turns an English audio file into a transcript on your PC.
+The second proposes transactions from that transcript through local llama.cpp.
 The eventual flow is Watch → phone queue → PC → review → Firefly III.
-English and USD are the initial scope; this component only transcribes audio.
+English and USD are the initial scope. Extraction always requires human review.
 
 For project decisions, implementation status, and continuing in a new session,
 read [plan.md](plan.md). [AGENTS.md](AGENTS.md) directs coding agents to that handoff.
@@ -108,6 +109,9 @@ Use the same project directory so the relative model cache can be found.
 - `src/fima/transcription.py` contains the reusable `transcribe_audio()` function.
   It checks the file, decodes audio to mono 16 kHz, rejects audio without detected
   speech, checks the GPU, and runs large-v3 in English transcription mode.
+- `src/fima/extraction.py` calls a local llama.cpp server, validates proposed
+  amounts and source quotes, and resolves supported date phrases in Python.
+- `evals/` contains 20 fabricated transcripts and a model-comparison runner.
 - `src/fima/__main__.py` also allows `python -m fima`.
 - `tests/` exercises error handling and pipeline behavior with runtime stand-ins.
   These tests do not measure recognition quality or prove that CUDA works.
@@ -149,17 +153,90 @@ Recordings, model weights, caches, and environments are excluded from Git.
 Keep saved transcripts outside the repository or inside the ignored
 `recordings/` directory. Transcripts contain personal information too.
 
+## 6. Propose transactions from text
+
+This component uses the existing `llama` installation separately from Whisper.
+FiMA sends text only to `127.0.0.1`, without HTTP proxies or redirects. Model
+downloads are a separate setup step; `fima extract` never downloads weights.
+It uses the Python standard library, with no new package dependencies.
+
+Use an existing GGUF model, or download a candidate using
+[the extraction evaluation guide](evals/README.md). Start the local server in
+another terminal (replace `/path/to/model.gguf` with the real file):
+
+```bash
+llama serve -m /path/to/model.gguf \
+    --alias fima-extractor --host 127.0.0.1 --port 8080 \
+    --device CUDA0 -ngl all -c 4096 -np 1 --cache-ram 0 \
+    --reasoning off --no-mmproj --no-webui --offline
+```
+
+Once the server reports that the model is ready:
+
+```bash
+uv run --offline fima extract "I bought chicken for 10 dollars."
+```
+
+The JSON result contains an expense for `"10.00"` USD, a description, its exact
+source quote, `date: null`, and a `missing_date` review issue. All successful
+results include `requires_review: true`. These are proposals; this project has
+no ledger connection yet.
+
+For relative dates, supply the **original recording's capture timestamp** with
+its timezone offset, even if processing happens days later:
+
+```bash
+uv run --offline fima extract "I paid 15.50 dollars for lunch yesterday." \
+    --captured-at 2026-11-02T00:30:00+02:00
+```
+
+Python resolves that date to `2026-11-01`. Supported date expressions are `today`,
+`yesterday`, and explicit `YYYY-MM-DD` dates. Other expressions remain quoted
+with `date: null` and `unresolved_date`. Omitting a date never silently selects
+the processing date. Without a capture timestamp, relative dates stay unresolved.
+
+You can save a transcript using the existing transcription command, then read it:
+
+```bash
+uv run --offline fima extract - < /tmp/lunch-transcript.txt
+```
+
+Keeping the two commands separate makes transcription errors easier to distinguish
+from interpretation errors. Use `--port` if your local llama.cpp server uses a
+different port, or `--model` if its alias differs from `fima-extractor`.
+
+Amounts are decimal strings checked with `Decimal`, never binary floating point.
+Missing amounts stay null. Explicit foreign currencies stay visible and are
+flagged as unsupported, without conversion. Transfers and ambiguous incoming
+money are flagged. Correction utterances create no new transactions in this
+initial version. Accounts, categories, posting, and correction application are
+future components.
+
+Validation checks structure and some financial constraints; it cannot establish
+that the model understood the transcript correctly. Check the source quote,
+amount, type, currency and description before accepting any proposal.
+
 ## Current validation status
 
 As of 2026-11-02, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 23 standard-library tests pass using
-the project interpreter. The user confirmed a real recording transcribed
+complete large-v3 weights are present. All 52 standard-library tests pass using
+the project interpreter. These include extraction validation, client error
+handling, CLI behavior, and evaluation scoring. The user confirmed a real recording transcribed
 successfully with cached weights after configuring the Fish GPU library path.
 
 Systematic recognition-quality checks and real-silence evaluation remain to be
 completed. The automated tests use runtime stand-ins, so their success does not
 establish recognition accuracy. Earlier network/GPU restrictions in the agent's
 sandbox should not be confused with the user's working host setup.
+
+Extraction was also exercised on the RTX 3090 using the already-present
+Qwen3.8-27B-UD-Q4_K_M model. It passed 19 of 20 fabricated development cases
+at roughly 2.2 seconds per example. The remaining shared-date/two-purchase case
+produced an invented source quote and was rejected by validation. Clarifying
+the quote instruction did not change that result. The cents/yesterday CLI
+smoke test succeeded. The Qwen3.5-9B/Gemma E2B comparison is still pending:
+model downloads were too slow, and partial transfers were stopped. These are
+limited development results; descriptions still need manual review.
 
 Use `uv sync --locked` to reproduce dependencies. The pinned faster-whisper
 version and PyAV bound avoid the newer PyAV API change removing

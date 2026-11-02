@@ -20,6 +20,7 @@ models/
 *.mp4
 *.bin
 *.safetensors
+*.gguf
 
 # Local credentials and workspace integration metadata.
 .env
@@ -30,3 +31,4 @@ models/
 
 tests/
 plan.md
+evals/
