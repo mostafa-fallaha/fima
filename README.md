@@ -5,6 +5,9 @@ The first component turns an English audio file into a transcript on your PC.
 The eventual flow is Watch → phone queue → PC → review → Firefly III.
 English and USD are the initial scope; this component only transcribes audio.
 
+For project decisions, implementation status, and continuing in a new session,
+read [plan.md](plan.md). [AGENTS.md](AGENTS.md) directs coding agents to that handoff.
+
 ## 1. Set up the Python environment
 
 Run commands from this project directory. Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
@@ -12,7 +15,7 @@ if needed, then:
 
 ```bash
 uv python install 3.12
-uv sync
+uv sync --locked
 ```
 
 `uv` creates `.venv/` for this project, without changing the system Python.
@@ -148,24 +151,17 @@ Keep saved transcripts outside the repository or inside the ignored
 
 ## Current validation status
 
-The standard-library tests passed using the environment's Python 3.14. The
-target Python 3.12 environment has not yet been installed or validated here.
+As of 2026-11-02, Python 3.12.13, the inference dependencies, `uv.lock`, and the
+complete large-v3 weights are present. All 23 standard-library tests pass using
+the project interpreter. The user confirmed a real recording transcribed
+successfully with cached weights after configuring the Fish GPU library path.
 
-The implementation environment could not resolve download hosts, so Python 3.12,
-inference dependencies, and a dependency lock could not yet be downloaded or
-resolved there. It also exposed no NVIDIA device files. Live transcription,
-real silence detection, and the offline model-cache check therefore remain
-pending on a GPU-accessible PC after setup.
+Systematic recognition-quality checks and real-silence evaluation remain to be
+completed. The automated tests use runtime stand-ins, so their success does not
+establish recognition accuracy. Earlier network/GPU restrictions in the agent's
+sandbox should not be confused with the user's working host setup.
 
-Once network access is available, generate and retain the full dependency lock:
-
-```bash
-uv lock
-uv sync --locked
-```
-
-Commit the resulting `uv.lock` alongside `pyproject.toml` after successful
-resolution. Subsequent setup should use `uv sync --locked` to reproduce those
-dependency versions. The currently pinned faster-whisper version and PyAV bound
-avoid the newer PyAV API change that removed `metadata_errors`; the full
-transitive dependency lock still needs generation.
+Use `uv sync --locked` to reproduce dependencies. The pinned faster-whisper
+version and PyAV bound avoid the newer PyAV API change removing
+`metadata_errors`. See [plan.md](plan.md) for troubleshooting history, remaining
+issues, and the next component.
