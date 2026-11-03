@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from .cuda import load_cuda_libraries
+
 
 class TranscriptionError(Exception):
     """An audio, setup, or inference problem that can be shown to the user."""
@@ -54,6 +56,7 @@ def transcribe_audio(audio_path: str | Path, *, offline: bool = False) -> str:
         raise TranscriptionError("No speech detected in the recording.")
 
     try:
+        load_cuda_libraries()
         if ctranslate2.get_cuda_device_count() < 1:
             raise TranscriptionError(
                 "No NVIDIA GPU is accessible. Check 'nvidia-smi' on the PC and "
@@ -61,9 +64,10 @@ def transcribe_audio(audio_path: str | Path, *, offline: bool = False) -> str:
             )
         if "float16" not in ctranslate2.get_supported_compute_types("cuda", 0):
             raise TranscriptionError("The accessible NVIDIA GPU does not support FP16 inference.")
-    except (RuntimeError, ValueError, OSError) as error:
+    except (ImportError, RuntimeError, ValueError, OSError) as error:
         raise TranscriptionError(
-            f"CUDA initialization failed. Check 'nvidia-smi' and the GPU setup in README.md. "
+            f"CUDA initialization failed. Run 'uv sync' to restore GPU runtime libraries; "
+            f"check 'nvidia-smi' and the GPU setup in README.md. "
             f"Details: {error}"
         ) from error
 

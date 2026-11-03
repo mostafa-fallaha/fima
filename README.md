@@ -38,32 +38,14 @@ a sandbox or container, check device access there as well as on the host.
 The application reports a GPU error rather than silently switching to the CPU.
 It does not install or change your system's NVIDIA driver.
 
-Make the environment's NVIDIA runtime libraries visible to the dynamic loader.
-Run the command for your shell in each new terminal session, from the project
-directory.
+FiMA automatically locates and loads the cuBLAS/cuDNN libraries installed by
+`uv sync` in the active Python environment. Both `transcribe` and `process` work
+without setting `LD_LIBRARY_PATH`, in Fish, Bash, or Zsh. No shell configuration
+change is needed. If those runtime packages are missing or damaged, run
+`uv sync --locked` again.
 
-For Bash or Zsh:
-
-```bash
-export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:$PWD/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-```
-
-For Fish:
-
-```fish
-set -gx LD_LIBRARY_PATH \
-    "$PWD/.venv/lib/python3.12/site-packages/nvidia/cublas/lib" \
-    "$PWD/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib" \
-    $LD_LIBRARY_PATH
-```
-
-Fish exports path variables as colon-separated lists; `set -gx` sets and exports
-the variable. Bash's `${VAR:+...}` syntax is not supported by Fish.
-
-This follows [faster-whisper's Linux runtime setup](https://github.com/SYSTRAN/faster-whisper#gpu).
-The NVIDIA driver, CUDA runtime libraries, and the Python package are different
-pieces: `nvidia-smi` checks driver access, while the export above locates runtime
-libraries used during inference.
+`nvidia-smi` checks access to the system driver; FiMA loads the separate runtime
+libraries that Whisper needs for inference.
 
 ## 3. Transcribe a recording
 
@@ -110,6 +92,8 @@ Use the same project directory so the relative model cache can be found.
 - `src/fima/transcription.py` contains the reusable `transcribe_audio()` function.
   It checks the file, decodes audio to mono 16 kHz, rejects audio without detected
   speech, checks the GPU, and runs large-v3 in English transcription mode.
+- `src/fima/cuda.py` loads the environment's Linux cuBLAS/cuDNN libraries by
+  absolute path before the GPU check, without relying on shell exports.
 - `src/fima/extraction.py` calls a local llama.cpp server, validates proposed
   amounts and source quotes, and resolves supported date phrases in Python.
 - `src/fima/processing.py` runs transcription in a child process, then starts
@@ -221,7 +205,7 @@ amount, type, currency and description before accepting any proposal.
 
 ## 7. Process a recording in one command
 
-With the Python environment and CUDA library path from sections 1–2 configured:
+After setting up the Python environment and checking GPU access in sections 1–2:
 
 ```bash
 uv run --offline fima process /path/to/recording.mp3 --offline
@@ -275,13 +259,18 @@ each stage separately. All financial proposals still require manual review.
 
 ## Current validation status
 
-As of 2026-11-02, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 75 standard-library tests pass using
+As of 2026-11-03, Python 3.12.13, the inference dependencies, `uv.lock`, and the
+complete large-v3 weights are present. All 82 standard-library tests pass using
 the project interpreter. These include extraction validation, client error
-handling, CLI behavior, evaluation scoring, sequential processing, and cleanup.
+handling, CLI behavior, automatic CUDA library loading, evaluation scoring,
+sequential processing, and cleanup.
 Cleanup tests include real child processes that exit on SIGTERM or require
-SIGKILL after the grace period. The user confirmed a real recording transcribed
-successfully with cached weights after configuring the Fish GPU library path.
+SIGKILL after the grace period. The user previously confirmed real transcription
+using a Fish library-path export; automatic loading now replaces that workaround.
+On 2026-11-03, both `uv run --offline fima transcribe ... --offline` and
+`uv run --offline fima process ... --offline` succeeded on the existing recording
+with `LD_LIBRARY_PATH` unset before starting each process. The recording was
+unchanged, and no FiMA inference children remained afterward.
 
 Systematic recognition-quality checks and real-silence evaluation remain to be
 completed. The automated tests use runtime stand-ins, so their success does not
