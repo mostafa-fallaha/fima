@@ -1,13 +1,19 @@
-"""Run local transcription and transaction extraction from the terminal."""
+"""Run local audio processing and connect to Firefly III from the terminal."""
 
 import argparse
+import getpass
 import json
 import sys
+import warnings
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
 from fima.extraction import ExtractionError, extract_transactions
+from fima.firefly import (
+    DEFAULT_DATA_DIR, DEFAULT_URL, FireflyError, check_firefly,
+    configure_firefly, create_smoke_transaction,
+)
 from fima.processing import DEFAULT_MODEL_PATH, ProcessingError, process_audio
 from fima.transcription import TranscriptionError, transcribe_audio
 
@@ -24,7 +30,7 @@ def capture_timestamp(value: str) -> datetime:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="fima", description="Transcribe English recordings and propose transactions locally."
+        prog="fima", description="Process English recordings locally and connect to Firefly III."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     transcription = commands.add_parser(
@@ -59,6 +65,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--captured-at", type=capture_timestamp,
         help="Original capture timestamp with offset; resolves today/yesterday.",
     )
+    firefly = commands.add_parser("firefly", help="Configure and test the local Firefly III connection.")
+    firefly.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
+                         help="Local credential directory (default: data/; keep private).")
+    firefly_commands = firefly.add_subparsers(dest="firefly_command", required=True)
+    configure = firefly_commands.add_parser("configure", help="Save a personal access token after checking the cash account.")
+    configure.add_argument("--url", default=DEFAULT_URL, help="Local Firefly URL (default: %(default)s).")
+    configure.add_argument("--cash-account-id", required=True, help="USD asset account ID shown in its Firefly URL.")
+    firefly_commands.add_parser("check", help="Check authentication and the configured USD cash account.")
+    firefly_commands.add_parser("smoke-test", help="Create one fictional $0.01 expense in Firefly; delete it after checking.")
     arguments = parser.parse_args(argv)
 
     try:
@@ -71,18 +86,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 captured_at=arguments.captured_at,
             )
             output = json.dumps(proposal, indent=2, ensure_ascii=False)
-        else:
+        elif arguments.command == "process":
             result = process_audio(
                 arguments.audio, offline=arguments.offline, model_path=arguments.model_path,
                 captured_at=arguments.captured_at,
                 progress=lambda message: print(f"fima: {message}", file=sys.stderr, flush=True),
             )
             output = json.dumps(result, indent=2, ensure_ascii=False)
-    except (TranscriptionError, ExtractionError, ProcessingError, OSError) as error:
+        else:
+            if arguments.firefly_command == "configure":
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", getpass.GetPassWarning)
+                        token = getpass.getpass("Firefly personal access token (hidden): ")
+                except getpass.GetPassWarning as error:
+                    raise FireflyError("Run configure in an interactive terminal that can hide token input.") from error
+                result = configure_firefly(arguments.url, token, arguments.cash_account_id, data_dir=arguments.data_dir)
+            elif arguments.firefly_command == "check":
+                result = check_firefly(data_dir=arguments.data_dir)
+            else:
+                result = create_smoke_transaction(data_dir=arguments.data_dir)
+            output = json.dumps(result, indent=2, ensure_ascii=False)
+    except (TranscriptionError, ExtractionError, ProcessingError, FireflyError, OSError, EOFError) as error:
         print(f"fima: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(f"fima: {arguments.command} interrupted.", file=sys.stderr)
+        if arguments.command == "firefly" and arguments.firefly_command == "smoke-test":
+            print("fima: Check Firefly before repeating the test; a transaction may have been created.", file=sys.stderr)
         return 130
 
     print(output)

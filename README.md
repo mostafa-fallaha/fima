@@ -4,7 +4,7 @@ A local, voice-first personal finance project, built one component at a time.
 The first component turns an English audio file into a transcript on your PC.
 The second proposes transactions from that transcript through local llama.cpp.
 `fima process` connects both stages in one command and manages their GPU lifetimes.
-The eventual flow is Watch → phone queue → PC → review → Firefly III.
+The eventual flow is Watch → phone queue → PC → Firefly III → review there.
 English and USD are the initial scope. Extraction always requires human review.
 
 For project decisions, implementation status, and continuing in a new session,
@@ -98,6 +98,8 @@ Use the same project directory so the relative model cache can be found.
   amounts and source quotes, and resolves supported date phrases in Python.
 - `src/fima/processing.py` runs transcription in a child process, then starts
   and stops a temporary llama.cpp server for extraction.
+- `src/fima/firefly.py` configures a local Firefly API connection and creates
+  one fictional test transaction. Recording imports are a later step.
 - `evals/` contains 20 fabricated transcripts and a model-comparison runner.
 - `src/fima/__main__.py` also allows `python -m fima`.
 - `tests/` exercises error handling and pipeline behavior with runtime stand-ins.
@@ -166,8 +168,9 @@ uv run --offline fima extract "I bought chicken for 10 dollars."
 
 The JSON result contains an expense for `"10.00"` USD, a description, its exact
 source quote, `date: null`, and a `missing_date` review issue. All successful
-results include `requires_review: true`. These are proposals; this project has
-no ledger connection yet.
+results include `requires_review: true`. These are proposals; `extract` and
+`process` do not import recordings into Firefly yet. Section 8 tests the connection
+with a separate fictional transaction.
 
 For relative dates, supply the **original recording's capture timestamp** with
 its timezone offset, even if processing happens days later:
@@ -257,13 +260,96 @@ llama.cpp server always runs offline; the first `--offline` belongs to uv.
 The standalone `transcribe` and `extract` commands remain available for checking
 each stage separately. All financial proposals still require manual review.
 
+## 8. Set up Firefly III and test the connection
+
+Firefly III will be the finance and review UI. The agreed workflow is to import
+complete, validated entries with `needs-review`, correct or delete them in
+Firefly, and remove that tag once reviewed. The tag is our review convention;
+tagged entries already affect balances. Incomplete or ambiguous recording results
+will stay local when recording imports are implemented.
+
+This first connector only configures access, checks a USD asset account, and
+creates a clearly fictional $0.01 connection test. It uses the standard library
+and does not change the recording-processing commands.
+
+The included Compose setup follows the [official Firefly Docker setup](https://github.com/firefly-iii/docker),
+with Firefly 6.7.9, MariaDB LTS, persistent database/upload volumes, and the web
+port bound to `127.0.0.1:8088`. It uses English and Asia/Beirut time. Scheduled
+jobs can be added when recurring transactions are needed.
+
+On this Arch PC, Docker is installed but stopped, and the Compose plugin is
+missing. Install the plugin and start the system engine in your terminal:
+
+```bash
+sudo pacman -S docker-compose
+sudo systemctl start docker
+```
+
+Then, from the FiMA directory:
+
+```bash
+uv run --offline python scripts/setup_firefly.py
+sudo docker --context default compose -f deploy/firefly/compose.yaml up -d
+```
+
+The explicit `default` context uses the system Docker engine, avoiding this PC's
+inactive Docker Desktop context. The setup script creates ignored
+`deploy/firefly/.env` secrets with mode 0600 and preserves an existing file.
+Keep those secrets with database backups. The first Docker image pull requires
+internet access and can take time. After migrations finish, open
+[Firefly III](http://localhost:8088).
+
+1. Register your own local Firefly login and choose USD as the primary currency.
+2. Create a USD asset account named **Cash USD**. Choose any opening balance
+   yourself; FiMA does not invent or set one. Open the account and note its
+   numeric ID in the URL.
+3. In **Options → Profile → OAuth → Personal Access Tokens**, create a token
+   named **FiMA**. Paste it into the hidden terminal prompt below, replacing
+   `ACCOUNT_ID` with the account's numeric ID:
+
+```bash
+uv run --offline fima firefly configure --cash-account-id ACCOUNT_ID
+uv run --offline fima firefly check
+uv run --offline fima firefly smoke-test
+```
+
+The token is saved in ignored `data/firefly.json` with mode 0600, so you do not
+need to export it in each terminal. It is never printed. Requests go directly to
+loopback, without HTTP proxies or redirects. A failed configuration check
+preserves the previous configuration.
+
+`smoke-test` creates **one real ledger entry** for $0.01, labelled
+**FiMA connection test — delete after verifying**, with `needs-review` and
+`fima-smoke-test` tags. Its JSON output links to the transaction. Inspect its
+amount, source cash account, notes and editable fields, then delete it in
+Firefly. Each successful invocation creates a new test; it is not an import or
+retry command. It leaves the test expense account available for future checks.
+If a POST fails or is interrupted, check Firefly before repeating it: the write
+may already have succeeded. The connector never automatically retries a write.
+
+To inspect startup or stop the service while keeping its data:
+
+```bash
+sudo docker --context default compose -f deploy/firefly/compose.yaml logs --tail=50 app
+sudo docker --context default compose -f deploy/firefly/compose.yaml stop
+```
+
+The containers have not yet been started in the development session: starting
+Docker requires the user's sudo password. Real API authentication and creation
+of the test transaction remain to be verified after the steps above.
+
 ## Current validation status
 
 As of 2026-11-03, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 82 standard-library tests pass using
+complete large-v3 weights are present. All 102 standard-library tests pass using
 the project interpreter. These include extraction validation, client error
 handling, CLI behavior, automatic CUDA library loading, evaluation scoring,
 sequential processing, and cleanup.
+Firefly tests cover configuration permissions, loopback/authentication checks,
+USD asset-account validation, request mapping, review tags, redacted errors,
+and write failures without retries. These use API stand-ins, not a running
+Firefly installation. Docker image tags and Compose YAML syntax were checked;
+actual Compose startup and a real Firefly smoke test remain pending.
 Cleanup tests include real child processes that exit on SIGTERM or require
 SIGKILL after the grace period. The user previously confirmed real transcription
 using a Fish library-path export; automatic loading now replaces that workaround.
