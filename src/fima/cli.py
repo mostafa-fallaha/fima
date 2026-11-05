@@ -14,7 +14,7 @@ from fima.firefly import (
     DEFAULT_DATA_DIR, DEFAULT_URL, FireflyError, check_firefly,
     configure_firefly, create_smoke_transaction,
 )
-from fima.processing import DEFAULT_MODEL_PATH, ProcessingError, process_audio
+from fima.processing import DEFAULT_MODEL_PATH, ProcessingError, extract_with_model, process_audio
 from fima.transcription import TranscriptionError, transcribe_audio
 
 
@@ -44,8 +44,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     extraction = commands.add_parser("extract", help="Propose transactions from an English transcript.")
     extraction.add_argument("transcript", help="Transcript text; use '-' to read standard input.")
-    extraction.add_argument("--model", default="fima-extractor", help="Local server model alias.")
-    extraction.add_argument("--port", type=int, default=8080, help="Local llama.cpp port (default: 8080).")
+    extraction.add_argument("--model-path", type=Path,
+                            help=f"GGUF file for automatic server startup (default: {DEFAULT_MODEL_PATH}).")
+    extraction.add_argument("--model", help="Connect to an existing server using this alias (default alias: fima-extractor).")
+    extraction.add_argument("--port", type=int, help="Connect to an existing server on this port (default: 8080 with --model).")
     extraction.add_argument(
         "--captured-at", type=capture_timestamp,
         help="Original capture timestamp with offset; resolves today/yesterday (never processing time).",
@@ -59,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     processing.add_argument(
         "--model-path", type=Path, default=DEFAULT_MODEL_PATH,
-        help="Extraction GGUF file (default: ~/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_M.gguf).",
+        help=f"Extraction GGUF file (default: {DEFAULT_MODEL_PATH}).",
     )
     processing.add_argument(
         "--captured-at", type=capture_timestamp,
@@ -75,16 +77,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     firefly_commands.add_parser("check", help="Check authentication and the configured USD cash account.")
     firefly_commands.add_parser("smoke-test", help="Create one fictional $0.01 expense in Firefly; delete it after checking.")
     arguments = parser.parse_args(argv)
+    if arguments.command == "extract" and arguments.model_path is not None and (
+        arguments.model is not None or arguments.port is not None
+    ):
+        parser.error("--model-path cannot be combined with existing-server options --model/--port.")
 
     try:
         if arguments.command == "transcribe":
             output = transcribe_audio(arguments.audio, offline=arguments.offline)
         elif arguments.command == "extract":
             transcript = sys.stdin.read() if arguments.transcript == "-" else arguments.transcript
-            proposal = extract_transactions(
-                transcript, model=arguments.model, port=arguments.port,
-                captured_at=arguments.captured_at,
-            )
+            if arguments.model is not None or arguments.port is not None:
+                proposal = extract_transactions(
+                    transcript, model=arguments.model if arguments.model is not None else "fima-extractor",
+                    port=arguments.port if arguments.port is not None else 8080,
+                    captured_at=arguments.captured_at,
+                )
+            else:
+                proposal = extract_with_model(
+                    transcript, model_path=arguments.model_path or DEFAULT_MODEL_PATH,
+                    captured_at=arguments.captured_at,
+                )
             output = json.dumps(proposal, indent=2, ensure_ascii=False)
         elif arguments.command == "process":
             result = process_audio(

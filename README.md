@@ -96,8 +96,8 @@ Use the same project directory so the relative model cache can be found.
   absolute path before the GPU check, without relying on shell exports.
 - `src/fima/extraction.py` calls a local llama.cpp server, validates proposed
   amounts and source quotes, and resolves supported date phrases in Python.
-- `src/fima/processing.py` runs transcription in a child process, then starts
-  and stops a temporary llama.cpp server for extraction.
+- `src/fima/processing.py` manages temporary llama.cpp servers for text/audio
+  extraction and evaluations, and runs transcription in a separate child process.
 - `src/fima/firefly.py` configures a local Firefly API connection and creates
   one fictional test transaction. Recording imports are a later step.
 - `evals/` contains 20 fabricated transcripts and a model-comparison runner.
@@ -149,22 +149,15 @@ FiMA sends text only to `127.0.0.1`, without HTTP proxies or redirects. Model
 downloads are a separate setup step; `fima extract` never downloads weights.
 It uses the Python standard library, with no new package dependencies.
 
-Use an existing GGUF model, or download a candidate using
-[the extraction evaluation guide](evals/README.md). Start the local server in
-another terminal (replace `/path/to/model.gguf` with the real file):
-
-```bash
-llama serve -m /path/to/model.gguf \
-    --alias fima-extractor --host 127.0.0.1 --port 8080 \
-    --device CUDA0 -ngl all -c 4096 -np 1 --cache-ram 0 \
-    --reasoning off --no-mmproj --no-webui --offline
-```
-
-Once the server reports that the model is ready:
+FiMA automatically starts the downloaded Gemma model, extracts the result, and
+stops its server on success, failure, or Ctrl+C. A second terminal is unnecessary:
 
 ```bash
 uv run --offline fima extract "I bought chicken for 10 dollars."
 ```
+
+The default GGUF is `~/models/gemma_4_e2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf`.
+To select another local model, pass `--model-path /path/to/model.gguf`.
 
 The JSON result contains an expense for `"10.00"` USD, a description, its exact
 source quote, `date: null`, and a `missing_date` review issue. All successful
@@ -192,8 +185,10 @@ uv run --offline fima extract - < /tmp/lunch-transcript.txt
 ```
 
 The standalone commands help distinguish transcription errors from interpretation
-errors. Use `--port` if your local llama.cpp server uses a
-different port, or `--model` if its alias differs from `fima-extractor`.
+errors. If you explicitly want to use an already-running server, pass `--port`
+(and optionally `--model` for its alias). For example, `--port 8080` connects to
+the existing `fima-extractor` alias without starting or stopping a server.
+Existing-server options cannot be combined with `--model-path`.
 
 Amounts are decimal strings checked with `Decimal`, never binary floating point.
 Missing amounts stay null. Explicit foreign currencies stay visible and are
@@ -215,7 +210,7 @@ uv run --offline fima process /path/to/recording.mp3 --offline
 ```
 
 The command uses your existing model at
-`~/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_M.gguf`. It checks that the recording,
+`~/models/gemma_4_e2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf`. It checks that the recording,
 model file and `llama` (or `llama-server`) executable are available before
 starting inference. It never installs a model or changes the original recording.
 
@@ -225,9 +220,9 @@ temporary llama.cpp server on a free port at `127.0.0.1`, waits until its own
 model is ready, and sends the transcript for extraction. The server uses local
 GGUF weights, CUDA0, thinking disabled, and a 4096-token context.
 
-You do not need to start a server manually for `process`. If you started the
-standalone server from section 6, stop it first to free GPU memory. FiMA stops
-only the child processes it creates; it does not stop other applications.
+Both `process` and `extract` manage their own servers by default. If you have an
+older manually started server running, you can stop it in its terminal to free
+GPU memory. FiMA stops only the child processes it creates.
 Each run loads the extraction model again and stops it after success, failure,
 or Ctrl+C. Startup is limited to 180 seconds; inference requests to 120 seconds.
 
@@ -248,11 +243,11 @@ Use the recording's real capture timestamp and timezone offset. File modificatio
 time and processing time are not used as substitutes. Omitting capture metadata
 leaves relative dates unresolved for review.
 
-When you download a smaller model, select its local GGUF file:
+To test another local GGUF, such as the previous Qwen model:
 
 ```bash
 uv run --offline fima process /path/to/recording.mp3 --offline \
-    --model-path /path/to/smaller-model.gguf
+    --model-path /home/mostafa/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_M.gguf
 ```
 
 The `--offline` after `process` controls Whisper's cached weights. The temporary
@@ -277,8 +272,8 @@ with Firefly 6.7.9, MariaDB LTS, persistent database/upload volumes, and the web
 port bound to `127.0.0.1:8088`. It uses English and Asia/Beirut time. Scheduled
 jobs can be added when recurring transactions are needed.
 
-On this Arch PC, Docker is installed but stopped, and the Compose plugin is
-missing. Install the plugin and start the system engine in your terminal:
+This Arch setup uses the system Docker engine and Compose plugin. If needed,
+install the plugin and start the engine in your terminal:
 
 ```bash
 sudo pacman -S docker-compose
@@ -334,14 +329,15 @@ sudo docker --context default compose -f deploy/firefly/compose.yaml logs --tail
 sudo docker --context default compose -f deploy/firefly/compose.yaml stop
 ```
 
-The containers have not yet been started in the development session: starting
-Docker requires the user's sudo password. Real API authentication and creation
-of the test transaction remain to be verified after the steps above.
+The user has now started Firefly and configured FiMA. On 2026-11-05, a read-only
+API check successfully authenticated to Firefly 6.7.9 and confirmed the configured
+active USD asset account. The test transaction's creation/viewing has not been
+independently verified; the check did not create another transaction.
 
 ## Current validation status
 
-As of 2026-11-03, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 102 standard-library tests pass using
+As of 2026-11-05, Python 3.12.13, the inference dependencies, `uv.lock`, and the
+complete large-v3 weights are present. All 116 standard-library tests pass using
 the project interpreter. These include extraction validation, client error
 handling, CLI behavior, automatic CUDA library loading, evaluation scoring,
 sequential processing, and cleanup.
@@ -349,7 +345,8 @@ Firefly tests cover configuration permissions, loopback/authentication checks,
 USD asset-account validation, request mapping, review tags, redacted errors,
 and write failures without retries. These use API stand-ins, not a running
 Firefly installation. Docker image tags and Compose YAML syntax were checked;
-actual Compose startup and a real Firefly smoke test remain pending.
+the user subsequently started Firefly, and its authenticated read-only API check
+passed on 2026-11-05. A real write smoke test has not been independently verified.
 Cleanup tests include real child processes that exit on SIGTERM or require
 SIGKILL after the grace period. The user previously confirmed real transcription
 using a Fish library-path export; automatic loading now replaces that workaround.
@@ -368,9 +365,27 @@ Qwen3.8-27B-UD-Q4_K_M model. It passed 19 of 20 fabricated development cases
 at roughly 2.2 seconds per example. The remaining shared-date/two-purchase case
 produced an invented source quote and was rejected by validation. Clarifying
 the quote instruction did not change that result. The cents/yesterday CLI
-smoke test succeeded. The Qwen3.5-9B/Gemma E2B comparison is still pending:
-model downloads were too slow, and partial transfers were stopped. These are
-limited development results; descriptions still need manual review.
+smoke test succeeded. The originally planned Qwen3.5-9B/Gemma Q8_0 comparison
+remains incomplete; those partial downloads were stopped.
+
+On 2026-11-05 the user's downloaded **Gemma 4 E2B IT UD-Q8_K_XL** was tested
+using an automatically managed server. It passed **15/20**, with 18 structurally
+valid proposals and a mean of **0.595 s** per case versus Qwen's earlier
+**19/20**, **2.175 s**. Cases, prompt/schema hashes, and extraction settings match.
+The downloaded 5,282,807,904-byte file is a different quantization from the
+originally planned Q8_0 candidate. These are development checks, not accuracy
+guarantees or a completed quantization comparison.
+
+Gemma failed shared-date quote validation and correction handling; it also
+misclassified ambiguous received money, a hypothetical purchase, and transcript
+instructions as transactions. The latter interpretation errors passed structural
+validation. Gemma is the user's trial default, with these limits preserved.
+
+Automatic `extract` passed a known amount/date check, and automatic `process`
+returned a transcript and one proposal from the existing recording without
+modifying it, with `LD_LIBRARY_PATH` unset. Interrupting another Gemma text run
+returned 130, produced no stdout, and removed its server. No Firefly writes were
+made during these tests. Descriptions and financial meaning still require review.
 
 The combined `process` command also succeeded on the user's existing recording
 with cached weights: it returned a transcript, one proposed transaction, and a

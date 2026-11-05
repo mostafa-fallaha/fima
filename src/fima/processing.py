@@ -9,7 +9,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
@@ -19,7 +20,7 @@ from uuid import uuid4
 from fima.extraction import ExtractionError, extract_transactions
 
 
-DEFAULT_MODEL_PATH = Path.home() / "models/qwen3.8/Qwen3.8-27B-UD-Q4_K_M.gguf"
+DEFAULT_MODEL_PATH = Path.home() / "models/gemma_4_e2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf"
 
 
 class ProcessingError(Exception):
@@ -116,29 +117,13 @@ def _wait_for_server(
     raise _startup_error("Timed out waiting for the temporary llama.cpp server to load.", log)
 
 
-def process_audio(
-    audio_path: str | Path, *, offline: bool = False,
-    model_path: str | Path = DEFAULT_MODEL_PATH,
-    captured_at: datetime | None = None,
-    progress: Callable[[str], None] | None = None,
-) -> dict:
-    """Return a transcript and proposals requiring review, leaving audio untouched.
-
-    Whisper runs in a child that exits before llama.cpp starts. The temporary
-    server uses only local weights and is stopped on success, failure or Ctrl+C.
-    Logs use an unlinked temporary file; no transcript or result file is saved.
-    """
-    report = progress if progress is not None else lambda message: None
-    audio = Path(audio_path).expanduser().resolve()
+def _server_command(model_path: str | Path) -> list[str]:
     model = Path(model_path).expanduser().resolve()
     try:
-        for path, label in ((audio, "Audio"), (model, "Extraction model")):
-            if not path.is_file() or path.stat().st_size == 0:
-                raise ProcessingError(f"{label} must be a nonempty file: {path}")
+        if not model.is_file() or model.stat().st_size == 0:
+            raise ProcessingError(f"Extraction model must be a nonempty file: {model}")
     except OSError as error:
         raise ProcessingError(f"Cannot access an input file: {error}") from error
-    if captured_at is not None and captured_at.utcoffset() is None:
-        raise ProcessingError("Capture timestamp must include a timezone offset.")
     executable = shutil.which("llama")
     if executable:
         server_command = [executable, "serve"]
@@ -148,43 +133,90 @@ def process_audio(
             raise ProcessingError("llama.cpp was not found. Install llama or llama-server; see README.md.")
         server_command = [executable]
 
-    report("Transcribing audio with Whisper large-v3...")
-    try:
-        transcript = _transcribe_in_subprocess(audio, offline=offline)
-    except OSError as error:
-        raise ProcessingError(f"Could not start transcription: {error}") from error
-    report("Transcription complete; Whisper has released the GPU.")
+    return [*server_command, "-m", str(model)]
 
+
+@contextmanager
+def _running_extraction_server(server_command: list[str]) -> Iterator[tuple[str, int]]:
     # Choose a free loopback port. Verify a unique model alias before sending any
     # transcript, so a port race cannot route extraction to an unrelated server.
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     alias = f"fima-process-{uuid4().hex}"
-    server_command.extend([
-        "-m", str(model), "--alias", alias, "--host", "127.0.0.1", "--port", str(port),
+    command = [*server_command,
+        "--alias", alias, "--host", "127.0.0.1", "--port", str(port),
         "--device", "CUDA0", "-ngl", "all", "-c", "4096", "-np", "1",
         "--cache-ram", "0", "--reasoning", "off", "--no-mmproj", "--no-webui", "--offline",
-    ])
-    report("Loading the local extraction model...")
+    ]
     with tempfile.TemporaryFile() as log:
         try:
             server = subprocess.Popen(
-                server_command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                 start_new_session=True,
             )
         except OSError as error:
             raise ProcessingError(f"Could not start llama.cpp: {error}") from error
         try:
             _wait_for_server(server, port, alias, log)
-            report("Extracting and validating proposed transactions...")
-            try:
-                proposal = extract_transactions(
-                    transcript, model=alias, port=port, captured_at=captured_at,
-                )
-            except ExtractionError as error:
-                raise ProcessingError(f"Extraction failed after transcription: {error}") from error
+            yield alias, port
         finally:
             _stop_process(server)
+
+
+@contextmanager
+def local_extraction_server(
+    model_path: str | Path = DEFAULT_MODEL_PATH,
+) -> Iterator[tuple[str, int]]:
+    """Start an owned offline server; always stop it when the caller leaves."""
+    with _running_extraction_server(_server_command(model_path)) as endpoint:
+        yield endpoint
+
+
+def extract_with_model(
+    transcript: str, *, model_path: str | Path = DEFAULT_MODEL_PATH,
+    captured_at: datetime | None = None,
+) -> dict:
+    """Extract text with a temporary server, without a second terminal."""
+    if not isinstance(transcript, str) or not transcript.strip():
+        raise ExtractionError("Transcript must contain some text.")
+    if captured_at is not None and captured_at.utcoffset() is None:
+        raise ExtractionError("Capture timestamp must include a timezone offset.")
+    with local_extraction_server(model_path) as (alias, port):
+        return extract_transactions(transcript, model=alias, port=port, captured_at=captured_at)
+
+
+def process_audio(
+    audio_path: str | Path, *, offline: bool = False,
+    model_path: str | Path = DEFAULT_MODEL_PATH,
+    captured_at: datetime | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Run Whisper, release its GPU, then extract with an owned local server."""
+    report = progress if progress is not None else lambda message: None
+    audio = Path(audio_path).expanduser().resolve()
+    try:
+        if not audio.is_file() or audio.stat().st_size == 0:
+            raise ProcessingError(f"Audio must be a nonempty file: {audio}")
+    except OSError as error:
+        raise ProcessingError(f"Cannot access an input file: {error}") from error
+    if captured_at is not None and captured_at.utcoffset() is None:
+        raise ProcessingError("Capture timestamp must include a timezone offset.")
+    command = _server_command(model_path)
+    report("Transcribing audio with Whisper large-v3...")
+    try:
+        transcript = _transcribe_in_subprocess(audio, offline=offline)
+    except OSError as error:
+        raise ProcessingError(f"Could not start transcription: {error}") from error
+    report("Transcription complete; Whisper has released the GPU.")
+    report("Loading the local extraction model...")
+    with _running_extraction_server(command) as (alias, port):
+        report("Extracting and validating proposed transactions...")
+        try:
+            proposal = extract_transactions(
+                transcript, model=alias, port=port, captured_at=captured_at,
+            )
+        except ExtractionError as error:
+            raise ProcessingError(f"Extraction failed after transcription: {error}") from error
     report("Extraction model stopped; proposals are ready for review.")
     return {"transcript": transcript, **proposal}
