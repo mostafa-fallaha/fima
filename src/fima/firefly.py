@@ -1,4 +1,4 @@
-"""Connect to local Firefly III and create an explicitly fictional smoke test."""
+"""Connect to local Firefly III through its authenticated JSON API."""
 
 import json
 import os
@@ -6,7 +6,7 @@ import tempfile
 from datetime import datetime
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -85,6 +85,55 @@ class FireflyClient:
         except (KeyError, TypeError) as error:
             raise FireflyError("Firefly returned incomplete account/version information.") from error
 
+    def find_external_id(self, external_id: str) -> str | None:
+        """Find exactly one split with this reference, including across pages.
+
+        A missing result is NOT proof that an earlier timed-out POST failed.
+        Never follow pagination URLs supplied by the remote server.
+        """
+        matches = []
+        page = 1
+        while True:
+            query = urlencode({"query": 'external_id_is:"' + external_id + '"',
+                               "limit": 100, "page": page})
+            response = self.request("GET", "/search/transactions?" + query)
+            try:
+                groups = response["data"]
+                pagination = response["meta"]["pagination"]
+                pages = pagination["total_pages"]
+                if (not isinstance(groups, list) or type(pages) is not int
+                        or not 1 <= pages <= 1000 or pagination["current_page"] != page):
+                    raise ValueError
+                for group in groups:
+                    identifier = transaction_id({"data": group})
+                    splits = group["attributes"]["transactions"]
+                    if not isinstance(splits, list) or not splits:
+                        raise ValueError
+                    found = [split for split in splits if split["external_id"] == external_id]
+                    # An unsupported/ignored search operator must fail closed.
+                    if not found:
+                        raise ValueError
+                    matches.extend(identifier for _ in found)
+                if page >= pages:
+                    break
+                page += 1
+            except (KeyError, TypeError, ValueError) as error:
+                raise FireflyError("Firefly returned incomplete external-ID search results; no write was attempted.") from error
+        if len(matches) > 1:
+            raise FireflyError("Several Firefly entries share the import external ID. Resolve them in Firefly before continuing.")
+        return matches[0] if matches else None
+
+
+def transaction_id(response: dict) -> str:
+    """Validate the group ID returned by a create or search request."""
+    try:
+        identifier = response["data"]["id"]
+        if not isinstance(identifier, str) or not identifier.isascii() or not identifier.isdigit() or int(identifier) < 1:
+            raise ValueError
+        return identifier
+    except (KeyError, TypeError, ValueError) as error:
+        raise FireflyError("Firefly returned an invalid transaction ID.") from error
+
 
 def configure_firefly(url: str, token: str, cash_account_id: str, *, data_dir: Path = DEFAULT_DATA_DIR) -> dict:
     client = FireflyClient(url, token)
@@ -101,7 +150,7 @@ def configure_firefly(url: str, token: str, cash_account_id: str, *, data_dir: P
     return result
 
 
-def _configured_client(data_dir: Path) -> tuple[FireflyClient, str]:
+def load_firefly(data_dir: Path) -> tuple[FireflyClient, str]:
     try:
         config = json.loads((data_dir / "firefly.json").read_text())
         return FireflyClient(config["url"], config["token"]), config["cash_account_id"]
@@ -110,13 +159,13 @@ def _configured_client(data_dir: Path) -> tuple[FireflyClient, str]:
 
 
 def check_firefly(*, data_dir: Path = DEFAULT_DATA_DIR) -> dict:
-    client, cash_account_id = _configured_client(data_dir)
+    client, cash_account_id = load_firefly(data_dir)
     return client.check(cash_account_id)
 
 
 def create_smoke_transaction(*, data_dir: Path = DEFAULT_DATA_DIR) -> dict:
     """Create one real ledger entry clearly marked as a fictional $0.01 test."""
-    client, cash_account_id = _configured_client(data_dir)
+    client, cash_account_id = load_firefly(data_dir)
     client.check(cash_account_id)
     payload = {
         "apply_rules": False,

@@ -77,11 +77,14 @@ Rules:
 
 def _resolve_date(date_text: str | None, captured_at: datetime | None) -> str | None:
     if date_text is None:
-        return None
+        return captured_at.date().isoformat() if captured_at is not None else None
     phrase = date_text.casefold()
     if phrase in ("today", "yesterday") and captured_at is not None:
         offset = 1 if phrase == "yesterday" else 0
-        return (captured_at.date() - timedelta(days=offset)).isoformat()
+        try:
+            return (captured_at.date() - timedelta(days=offset)).isoformat()
+        except OverflowError:
+            return None
     if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date_text):
         try:
             return date.fromisoformat(date_text).isoformat()
@@ -104,6 +107,10 @@ def validate_proposal(
     if any(not isinstance(issue, str) or issue not in ISSUES for issue in issues):
         raise ExtractionError("Model output contains an unknown issue code.")
     flags = set(issues)
+    # Missing dates are determined from fields and the agreed capture-date
+    # default, even when the model emitted a missing_date flag itself.
+    if transactions:
+        flags.discard("missing_date")
     if "correction" in flags and transactions:
         raise ExtractionError("A correction cannot create new transactions.")
     if "no_transaction" in flags and transactions:
@@ -151,7 +158,7 @@ def validate_proposal(
         ):
             invalid("date_text (must quote the source exactly)")
         resolved_date = _resolve_date(date_text, captured_at)
-        if date_text is None:
+        if date_text is None and resolved_date is None:
             flags.add("missing_date")
         elif resolved_date is None:
             flags.add("unresolved_date")

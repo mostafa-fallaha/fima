@@ -4,6 +4,7 @@ A local, voice-first personal finance project, built one component at a time.
 The first component turns an English audio file into a transcript on your PC.
 The second proposes transactions from that transcript through local llama.cpp.
 `fima process` connects both stages in one command and manages their GPU lifetimes.
+Add `--post` to save results and import complete USD entries into Firefly III.
 The eventual flow is Watch → phone queue → PC → Firefly III → review there.
 English and USD are the initial scope. Extraction always requires human review.
 
@@ -59,7 +60,7 @@ WAV, M4A, MP3, and other formats supported by PyAV can be decoded. The recording
 is read without modification. The first speech-containing recording downloads
 the large-v3 model weights from Hugging Face into `.cache/models/`.
 The model is several GB; subsequent runs reuse that cache. Audio is not uploaded.
-No financial fields are extracted yet, so spoken amounts appear as recognized
+The `transcribe` command extracts no financial fields, so spoken amounts appear as recognized
 by Whisper and still need checking by listening to the recording.
 
 The transcript goes to standard output. Problems go to standard error and return
@@ -98,8 +99,10 @@ Use the same project directory so the relative model cache can be found.
   amounts and source quotes, and resolves supported date phrases in Python.
 - `src/fima/processing.py` manages temporary llama.cpp servers for text/audio
   extraction and evaluations, and runs transcription in a separate child process.
-- `src/fima/firefly.py` configures a local Firefly API connection and creates
-  one fictional test transaction. Recording imports are a later step.
+- `src/fima/firefly.py` configures a local Firefly API connection, searches import
+  external IDs, and creates one fictional connection-test transaction.
+- `src/fima/importing.py` saves recording results and per-entry posting progress
+  in SQLite, holds unresolved recordings, and imports complete entries for review.
 - `evals/` contains 20 fabricated transcripts and a model-comparison runner.
 - `src/fima/__main__.py` also allows `python -m fima`.
 - `tests/` exercises error handling and pipeline behavior with runtime stand-ins.
@@ -161,9 +164,9 @@ To select another local model, pass `--model-path /path/to/model.gguf`.
 
 The JSON result contains an expense for `"10.00"` USD, a description, its exact
 source quote, `date: null`, and a `missing_date` review issue. All successful
-results include `requires_review: true`. These are proposals; `extract` and
-`process` do not import recordings into Firefly yet. Section 8 tests the connection
-with a separate fictional transaction.
+results include `requires_review: true`. `extract` and ordinary `process` return
+proposals. `process --post` saves results and imports eligible entries for review
+(section 9). Section 8 tests the connection with a separate fictional transaction.
 
 For relative dates, supply the **original recording's capture timestamp** with
 its timezone offset, even if processing happens days later:
@@ -176,7 +179,9 @@ uv run --offline fima extract "I paid 15.50 dollars for lunch yesterday." \
 Python resolves that date to `2026-11-01`. Supported date expressions are `today`,
 `yesterday`, and explicit `YYYY-MM-DD` dates. Other expressions remain quoted
 with `date: null` and `unresolved_date`. Omitting a date never silently selects
-the processing date. Without a capture timestamp, relative dates stay unresolved.
+the processing date. When no date is spoken, FiMA uses the supplied capture
+timestamp's local calendar date and keeps `date_text: null`. Without capture
+metadata, omitted dates stay missing and relative dates stay unresolved.
 
 You can save a transcript using the existing transcription command, then read it:
 
@@ -230,9 +235,9 @@ Stage messages go to stderr. On success, stdout contains one complete JSON
 object with `transcript`, `transactions`, `issues`, and `requires_review: true`.
 On failure or interruption, it prints no partial successful JSON and cleans up
 its children. Exit codes remain 0, 1, 2 and 130 as described above.
-Temporary server logs are discarded, and FiMA does not save transcripts/results.
+Temporary server logs are discarded. Without `--post`, FiMA does not save transcripts/results.
 
-Supply capture time explicitly when the recording says today or yesterday:
+Supply capture time to default an omitted date or resolve today/yesterday:
 
 ```bash
 uv run --offline fima process /path/to/recording.mp3 --offline \
@@ -241,7 +246,7 @@ uv run --offline fima process /path/to/recording.mp3 --offline \
 
 Use the recording's real capture timestamp and timezone offset. File modification
 time and processing time are not used as substitutes. Omitting capture metadata
-leaves relative dates unresolved for review.
+leaves omitted/relative dates unresolved for review.
 
 To test another local GGUF, such as the previous Qwen model:
 
@@ -261,11 +266,11 @@ Firefly III will be the finance and review UI. The agreed workflow is to import
 complete, validated entries with `needs-review`, correct or delete them in
 Firefly, and remove that tag once reviewed. The tag is our review convention;
 tagged entries already affect balances. Incomplete or ambiguous recording results
-will stay local when recording imports are implemented.
+stay local when using `process --post`.
 
-This first connector only configures access, checks a USD asset account, and
-creates a clearly fictional $0.01 connection test. It uses the standard library
-and does not change the recording-processing commands.
+The connection commands configure access, check a USD asset account, and create
+a clearly fictional $0.01 connection test. They use the Python standard library.
+Recording imports use the same saved credentials (section 9).
 
 The included Compose setup follows the [official Firefly Docker setup](https://github.com/firefly-iii/docker),
 with Firefly 6.7.9, MariaDB LTS, persistent database/upload volumes, and the web
@@ -334,17 +339,110 @@ API check successfully authenticated to Firefly 6.7.9 and confirmed the configur
 active USD asset account. The test transaction's creation/viewing has not been
 independently verified; the check did not create another transaction.
 
+## 9. Import a recording into Firefly
+
+After the connection setup in section 8, use:
+
+```bash
+uv run --offline fima process /path/to/recording.mp3 --offline --post \
+    --captured-at 2026-11-05T12:00:00+02:00
+```
+
+Replace the example capture time with the recording's actual timestamp. An
+omitted date defaults to that timestamp's local calendar date. `Today`/`yesterday`
+are resolved relative to it; an explicit spoken YYYY-MM-DD date takes precedence
+and needs no capture metadata. Without both a spoken date and capture metadata,
+the recording stays held for `missing_date`. Unsupported/invalid spoken dates
+stay unresolved even when capture time is supplied.
+
+FiMA saves the transcript, validated proposal and capture/model metadata before
+contacting Firefly. Only a nonempty proposal with **no issues** can be imported.
+Any missing/ambiguous field, unsupported currency, transfer, correction or other
+issue holds the entire recording locally, including its complete entries.
+The JSON result adds `import.status` (`held` or `posted`), `recording_id`, the
+journal path, and per-entry Firefly IDs/links for successful imports. Both held
+and posted results return exit status 0; errors return 1 and Ctrl+C returns 130.
+Errors print no partial success JSON; earlier successful writes remain saved.
+
+Expenses become withdrawals from the configured USD cash account to an expense
+account named `FiMA expenses`. Income becomes deposits from a revenue account
+named `FiMA income` into the same cash account. Firefly creates those counterpart
+accounts as needed. Entries have `needs-review`, the original transcript in notes,
+and `reconciled: false`; Firefly rules and webhooks are disabled for these writes.
+Review amounts, dates and meaning in Firefly, correct/delete entries as needed,
+then remove `needs-review`. These are real entries and affect balances immediately.
+Validation checks structure and basic rules; it cannot prove the spoken facts.
+
+The local journal is `data/imports.sqlite3` (mode 0600); it contains private
+transcripts and posting progress. Keep it with your local backups. Credentials
+stay in `data/firefly.json`, and Firefly keeps the financial ledger in MariaDB.
+`--data-dir PATH` selects another credential/journal directory; keep that directory
+private and excluded from Git. One importer can use a given directory at a time.
+
+Repeat the same command to resume. File-content SHA-256 identifies a recording,
+so renames/copies reuse saved proposals and progress without loading the models.
+Separate recordings of similar purchases remain separate. Confirmed entries are
+never updated or recreated, even if you edit/delete them in Firefly. A changed
+model path does not rerun a saved proposal. Changing capture metadata reprocesses
+only a recording with no import attempts; after an attempt, repeat its original
+capture timestamp and make financial corrections in Firefly.
+Saved results from the earlier date policy are updated on their next run when
+no import has been attempted: omitted dates use the saved capture timestamp,
+the resolved `missing_date` flag is cleared, and all other issues are retained.
+This reuses the saved transcript/proposal without rerunning AI. Posted or
+uncertain results are never changed by this migration.
+
+For a clean test run, reset the local journal from the project directory:
+
+```bash
+uv run --offline python scripts/reset_import_journal.py
+```
+
+The helper clears all saved results and import progress in `data/imports.sqlite3`
+in one transaction, preserving the tables, credentials and Firefly data. It
+refuses to run while an importer holds the directory lock. Use `--data-dir PATH`
+if your test journal is elsewhere. This also clears recovery history, so use it
+for test data whose Firefly state you have checked. Your next `process --post`
+run repeats AI processing and searches Firefly for the stable external IDs before
+creating entries; existing matching entries are reused.
+
+Before each creation FiMA searches for the stable per-entry external ID using
+Firefly's [`external_id_is` operator](https://github.com/firefly-iii/firefly-iii/blob/v6.7.9/app/Support/Search/OperatorQuerySearch.php).
+It commits an `uncertain` marker locally before sending the POST. After a lost
+response or interruption, rerunning adopts an exact unique match and continues
+with later entries. Failed, malformed or ambiguous searches stop the import.
+If an uncertain entry cannot be found, FiMA stops without reposting: an absent
+search result cannot prove that the earlier request failed. Inspect Firefly using
+the external ID shown in the error. This version has no command to reset an
+uncertain entry; preserve the journal for manual recovery. There is no exactly-once
+guarantee across lost journals, separate data directories or external-ID edits.
+
+Gemma remains the default; `--model-path` selects Qwen or another local GGUF for
+a new recording. Saved development scores below are 15/20 for Gemma and 19/20
+for Qwen under the earlier date policy. Two fixture expectations now use the
+capture-date default, so the saved reports have different fixture hashes; no
+new model scores have been measured. No live Firefly write was performed to
+verify this change.
+
 ## Current validation status
 
 As of 2026-11-05, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 116 standard-library tests pass using
-the project interpreter. These include extraction validation, client error
+complete large-v3 weights are present. The earlier full suite of 147 standard-library
+tests passed using the project interpreter; four added reset-helper tests passed
+separately with temporary databases. These include extraction validation, client error
 handling, CLI behavior, automatic CUDA library loading, evaluation scoring,
 sequential processing, and cleanup.
 Firefly tests cover configuration permissions, loopback/authentication checks,
 USD asset-account validation, request mapping, review tags, redacted errors,
-and write failures without retries. These use API stand-ins, not a running
-Firefly installation. Docker image tags and Compose YAML syntax were checked;
+and write failures without retries. Import tests use real SQLite and a temporary
+loopback HTTP server with fabricated data, including a committed write followed
+by a disconnected response. Date tests cover capture-local defaults, explicit
+date precedence, absent capture metadata, unsupported dates, saved-result
+migration and protection of attempted entries. The full suite needs permission to bind a local
+socket; it requires no model, GPU, or live Firefly installation.
+Tests/evaluation source and fabricated cases are now eligible for Git tracking;
+generated reports, recordings, models, credentials and journals stay ignored.
+Docker image tags and Compose YAML syntax were checked;
 the user subsequently started Firefly, and its authenticated read-only API check
 passed on 2026-11-05. A real write smoke test has not been independently verified.
 Cleanup tests include real child processes that exit on SIGTERM or require

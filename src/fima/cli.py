@@ -15,6 +15,7 @@ from fima.firefly import (
     configure_firefly, create_smoke_transaction,
 )
 from fima.processing import DEFAULT_MODEL_PATH, ProcessingError, extract_with_model, process_audio
+from fima.importing import ImportingError, process_and_post
 from fima.transcription import TranscriptionError, transcribe_audio
 
 
@@ -50,7 +51,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     extraction.add_argument("--port", type=int, help="Connect to an existing server on this port (default: 8080 with --model).")
     extraction.add_argument(
         "--captured-at", type=capture_timestamp,
-        help="Original capture timestamp with offset; resolves today/yesterday (never processing time).",
+        help="Original capture timestamp with offset; defaults omitted dates and resolves today/yesterday.",
     )
     processing = commands.add_parser(
         "process", help="Transcribe audio, then propose transactions using a temporary local model."
@@ -65,8 +66,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     processing.add_argument(
         "--captured-at", type=capture_timestamp,
-        help="Original capture timestamp with offset; resolves today/yesterday.",
+        help="Original capture timestamp with offset; defaults omitted dates and resolves today/yesterday.",
     )
+    processing.add_argument("--post", action="store_true",
+                            help="Save results and import complete USD entries into Firefly for review.")
+    processing.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
+                            help="Credential and import-journal directory for --post (default: data/).")
     firefly = commands.add_parser("firefly", help="Configure and test the local Firefly III connection.")
     firefly.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                          help="Local credential directory (default: data/; keep private).")
@@ -100,10 +105,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             output = json.dumps(proposal, indent=2, ensure_ascii=False)
         elif arguments.command == "process":
-            result = process_audio(
+            processor = process_and_post if arguments.post else process_audio
+            posting_options = {"data_dir": arguments.data_dir} if arguments.post else {}
+            result = processor(
                 arguments.audio, offline=arguments.offline, model_path=arguments.model_path,
                 captured_at=arguments.captured_at,
                 progress=lambda message: print(f"fima: {message}", file=sys.stderr, flush=True),
+                **posting_options,
             )
             output = json.dumps(result, indent=2, ensure_ascii=False)
         else:
@@ -120,13 +128,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = create_smoke_transaction(data_dir=arguments.data_dir)
             output = json.dumps(result, indent=2, ensure_ascii=False)
-    except (TranscriptionError, ExtractionError, ProcessingError, FireflyError, OSError, EOFError) as error:
+    except (TranscriptionError, ExtractionError, ProcessingError, FireflyError, ImportingError, OSError, EOFError) as error:
         print(f"fima: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(f"fima: {arguments.command} interrupted.", file=sys.stderr)
         if arguments.command == "firefly" and arguments.firefly_command == "smoke-test":
             print("fima: Check Firefly before repeating the test; a transaction may have been created.", file=sys.stderr)
+        elif arguments.command == "process" and arguments.post:
+            print("fima: Import progress is saved. Repeat the same command to reconcile any uncertain write.", file=sys.stderr)
         return 130
 
     print(output)
