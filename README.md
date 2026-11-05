@@ -101,6 +101,8 @@ Use the same project directory so the relative model cache can be found.
   extraction and evaluations, and runs transcription in a separate child process.
 - `src/fima/firefly.py` configures a local Firefly API connection, searches import
   external IDs, and creates one fictional connection-test transaction.
+- `src/fima/categories.py` creates the initial category list on explicit setup,
+  preserving existing categories.
 - `src/fima/importing.py` saves recording results and per-entry posting progress
   in SQLite, holds unresolved recordings, and imports complete entries for review.
 - `evals/` contains 20 fabricated transcripts and a model-comparison runner.
@@ -339,6 +341,45 @@ API check successfully authenticated to Firefly 6.7.9 and confirmed the configur
 active USD asset account. The test transaction's creation/viewing has not been
 independently verified; the check did not create another transaction.
 
+### Create the initial categories
+
+Run this once after configuring Firefly:
+
+```bash
+uv run --offline fima firefly setup-categories
+```
+
+The command creates the 23 categories below. Category setup is explicit so you
+control when this initial list is added. Repeating the command creates only
+missing names; matching ignores case and surrounding whitespace. Existing
+categories, their notes and unrelated categories are preserved. The JSON result
+lists created/existing categories and their counts. With another credential
+directory, use `fima firefly --data-dir PATH setup-categories`.
+
+| Group label | Categories |
+| --- | --- |
+| Food & Drinks | Groceries, Restaurants, Snacks & Drinks |
+| Transportation | Fuel, Car Maintenance, Public Transportation |
+| Shopping | Clothing, Electronics, Personal Items |
+| Entertainment | Gaming, Outings & Activities, Subscriptions |
+| Health & Fitness | Healthcare, Gym & Fitness |
+| Housing | Rent, Utilities, Home Supplies |
+| Finance | Fees & Charges, Investments |
+| Income | Salary, Other Income |
+| Other | Gifts, Miscellaneous |
+
+[Firefly 6.7.9's category API](https://github.com/firefly-iii/firefly-iii/blob/v6.7.9/app/Api/V1/Requests/Models/Category/StoreRequest.php)
+has no parent-group field. These are flat categories with the exact names above;
+each new category's notes record `Group: Food & Drinks`, for example. Group
+labels in the output describe this initial list and do not represent a native
+Firefly hierarchy. Existing category notes are left as you set them.
+
+The complete existing category list is checked before any creation. On a failed
+or interrupted creation, earlier categories may already exist; repeat the command
+to check existing names before continuing. POSTs are not automatically retried.
+This sets up the list; assigning categories to extracted transactions is a later
+component. Category setup does not run during ordinary recording processing.
+
 ## 9. Import a recording into Firefly
 
 After the connection setup in section 8, use:
@@ -427,9 +468,9 @@ verify this change.
 ## Current validation status
 
 As of 2026-11-05, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. The earlier full suite of 147 standard-library
-tests passed using the project interpreter; four added reset-helper tests passed
-separately with temporary databases. These include extraction validation, client error
+complete large-v3 weights are present. All 162 standard-library tests passed
+using the project interpreter, including category setup and the reset helper.
+These include extraction validation, client error
 handling, CLI behavior, automatic CUDA library loading, evaluation scoring,
 sequential processing, and cleanup.
 Firefly tests cover configuration permissions, loopback/authentication checks,
@@ -440,8 +481,12 @@ by a disconnected response. Date tests cover capture-local defaults, explicit
 date precedence, absent capture metadata, unsupported dates, saved-result
 migration and protection of attempted entries. The full suite needs permission to bind a local
 socket; it requires no model, GPU, or live Firefly installation.
-Tests/evaluation source and fabricated cases are now eligible for Git tracking;
-generated reports, recordings, models, credentials and journals stay ignored.
+Category tests check the requested names/notes, existing-category preservation,
+pagination, failures and reruns after a lost response. Category setup was tested
+with API stand-ins; no live categories were created during verification.
+Current ignore rules exclude test/evaluation source and fabricated cases from Git;
+the checks above exist locally. Generated reports, recordings, models, credentials
+and journals stay ignored.
 Docker image tags and Compose YAML syntax were checked;
 the user subsequently started Firefly, and its authenticated read-only API check
 passed on 2026-11-05. A real write smoke test has not been independently verified.

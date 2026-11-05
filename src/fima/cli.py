@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fima.extraction import ExtractionError, extract_transactions
+from fima.categories import setup_categories
 from fima.firefly import (
     DEFAULT_DATA_DIR, DEFAULT_URL, FireflyError, check_firefly,
     configure_firefly, create_smoke_transaction,
@@ -81,6 +82,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure.add_argument("--cash-account-id", required=True, help="USD asset account ID shown in its Firefly URL.")
     firefly_commands.add_parser("check", help="Check authentication and the configured USD cash account.")
     firefly_commands.add_parser("smoke-test", help="Create one fictional $0.01 expense in Firefly; delete it after checking.")
+    firefly_commands.add_parser("setup-categories", help="Create the initial categories, preserving existing ones.")
     arguments = parser.parse_args(argv)
     if arguments.command == "extract" and arguments.model_path is not None and (
         arguments.model is not None or arguments.port is not None
@@ -125,6 +127,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = configure_firefly(arguments.url, token, arguments.cash_account_id, data_dir=arguments.data_dir)
             elif arguments.firefly_command == "check":
                 result = check_firefly(data_dir=arguments.data_dir)
+            elif arguments.firefly_command == "setup-categories":
+                result = setup_categories(data_dir=arguments.data_dir)
             else:
                 result = create_smoke_transaction(data_dir=arguments.data_dir)
             output = json.dumps(result, indent=2, ensure_ascii=False)
@@ -135,6 +139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"fima: {arguments.command} interrupted.", file=sys.stderr)
         if arguments.command == "firefly" and arguments.firefly_command == "smoke-test":
             print("fima: Check Firefly before repeating the test; a transaction may have been created.", file=sys.stderr)
+        elif arguments.command == "firefly" and arguments.firefly_command == "setup-categories":
+            print("fima: Some categories may have been created. Repeat setup-categories to check existing names before continuing.", file=sys.stderr)
         elif arguments.command == "process" and arguments.post:
             print("fima: Import progress is saved. Repeat the same command to reconcile any uncertain write.", file=sys.stderr)
         return 130
