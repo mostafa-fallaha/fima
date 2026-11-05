@@ -1,4 +1,4 @@
-"""Create the user's initial Firefly categories on explicit setup."""
+"""Set up the initial categories and discover the user's Firefly categories."""
 
 from pathlib import Path
 
@@ -51,7 +51,8 @@ def _list_categories(client: FireflyClient) -> dict[str, dict]:
             pagination = response["meta"]["pagination"]
             pages = pagination["total_pages"]
             if (not isinstance(records, list) or type(pages) is not int
-                    or not 1 <= pages <= 1000 or pagination["current_page"] != page
+                    or not 1 <= pages <= 1000 or type(pagination["current_page"]) is not int
+                    or pagination["current_page"] != page
                     or (total_pages is not None and pages != total_pages)):
                 raise ValueError
             total_pages = pages
@@ -66,6 +67,14 @@ def _list_categories(client: FireflyClient) -> dict[str, dict]:
             page += 1
         except (KeyError, TypeError, ValueError) as error:
             raise FireflyError("Firefly returned incomplete or conflicting category pages. No categories were created.") from error
+
+
+def list_categories(client: FireflyClient) -> list[dict]:
+    """Discover the user's actual categories, including custom names."""
+    categories = list(_list_categories(client).values())
+    if len({category["id"] for category in categories}) != len(categories):
+        raise FireflyError("Firefly returned conflicting category IDs.")
+    return categories
 
 
 def setup_categories(*, data_dir: Path = DEFAULT_DATA_DIR) -> dict:

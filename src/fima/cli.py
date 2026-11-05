@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
+from fima.classification import ClassificationError, discover_catalog
 from fima.extraction import ExtractionError, extract_transactions
 from fima.categories import setup_categories
 from fima.firefly import (
@@ -44,7 +45,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Use cached model weights only; do not contact the model download service.",
     )
-    extraction = commands.add_parser("extract", help="Propose transactions from an English transcript.")
+    extraction = commands.add_parser("extract", help="Extract transaction facts from an English transcript.")
     extraction.add_argument("transcript", help="Transcript text; use '-' to read standard input.")
     extraction.add_argument("--model-path", type=Path,
                             help=f"GGUF file for automatic server startup (default: {DEFAULT_MODEL_PATH}).")
@@ -70,7 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Original capture timestamp with offset; defaults omitted dates and resolves today/yesterday.",
     )
     processing.add_argument("--post", action="store_true",
-                            help="Save results and import complete USD entries into Firefly for review.")
+                            help="Save extracted facts, classify with Firefly's catalog, and import complete USD entries for review.")
     processing.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                             help="Credential and import-journal directory for --post (default: data/).")
     firefly = commands.add_parser("firefly", help="Configure and test the local Firefly III connection.")
@@ -83,6 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     firefly_commands.add_parser("check", help="Check authentication and the configured USD cash account.")
     firefly_commands.add_parser("smoke-test", help="Create one fictional $0.01 expense in Firefly; delete it after checking.")
     firefly_commands.add_parser("setup-categories", help="Create the initial categories, preserving existing ones.")
+    firefly_commands.add_parser("catalog", help="List the Firefly categories and active budgets used for classification.")
     arguments = parser.parse_args(argv)
     if arguments.command == "extract" and arguments.model_path is not None and (
         arguments.model is not None or arguments.port is not None
@@ -129,10 +131,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = check_firefly(data_dir=arguments.data_dir)
             elif arguments.firefly_command == "setup-categories":
                 result = setup_categories(data_dir=arguments.data_dir)
+            elif arguments.firefly_command == "catalog":
+                result = discover_catalog(data_dir=arguments.data_dir)
             else:
                 result = create_smoke_transaction(data_dir=arguments.data_dir)
             output = json.dumps(result, indent=2, ensure_ascii=False)
-    except (TranscriptionError, ExtractionError, ProcessingError, FireflyError, ImportingError, OSError, EOFError) as error:
+    except (TranscriptionError, ExtractionError, ClassificationError, ProcessingError, FireflyError, ImportingError, OSError, EOFError) as error:
         print(f"fima: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

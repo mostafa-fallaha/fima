@@ -10,7 +10,10 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fima.categories import FALLBACK_CATEGORY
+from fima.categories import normalize_category
+from fima.classification import (
+    ClassificationError, budget_fits_category, classify_with_model, load_catalog, validate_classification,
+)
 from fima.extraction import ExtractionError, TRANSACTION_SCHEMA, validate_proposal
 from fima.firefly import DEFAULT_DATA_DIR, FireflyError, load_firefly, transaction_id
 from fima.processing import DEFAULT_MODEL_PATH, process_audio
@@ -67,6 +70,13 @@ def _journal(data_dir: Path) -> Iterator[sqlite3.Connection]:
                     firefly_id TEXT,
                     PRIMARY KEY (audio_sha256, ordinal)
                 );
+                CREATE TABLE IF NOT EXISTS classifications (
+                    audio_sha256 TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    result TEXT NOT NULL,
+                    PRIMARY KEY (audio_sha256, ordinal),
+                    FOREIGN KEY (audio_sha256, ordinal) REFERENCES entries(audio_sha256, ordinal) ON DELETE CASCADE
+                );
             """)
             yield connection
         finally:
@@ -87,27 +97,29 @@ def _validate_result(
         transactions = []
         for item in result["transactions"]:
             required = set(TRANSACTION_SCHEMA["required"]) | {"date"}
-            if set(item) != required and not (legacy_categories and set(item) == required - {"category"}):
+            if set(item) != required and not (legacy_categories and set(item) == required | {"category"}):
                 raise ValueError
             transactions.append({key: item.get(key) for key in TRANSACTION_SCHEMA["required"]})
         checked = {"transcript": transcript, **validate_proposal(
             {"transactions": transactions, "issues": result["issues"]},
             transcript, captured_at=captured_at,
         )}
-        if legacy_categories and not allow_defaults:
-            # A legacy attempted entry may already exist without a category in
-            # Firefly. Keep that original snapshot; don't imply it was updated.
+        if legacy_categories:
+            # Legacy labels are snapshots. Classification of pending entries is
+            # saved separately, without rewriting their financial extraction.
             for original, item in zip(result["transactions"], checked["transactions"]):
-                if "category" not in original:
-                    item.pop("category")
+                if "category" in original:
+                    category = original["category"]
+                    if not isinstance(category, str) or normalize_category(category) != category:
+                        raise ValueError
+                    item["category"] = category
         if checked != result:
             if not allow_defaults:
                 raise ValueError
-            # Upgrade only omitted dates/categories from the earlier policies.
+            # Upgrade only omitted dates from the earlier policy.
             # Keep all other facts and unrelated issue flags unchanged.
             upgraded = {**result, "transactions": [
-                {**item, "category": item.get("category", FALLBACK_CATEGORY),
-                 "date": captured_at.date().isoformat()
+                {**item, "date": captured_at.date().isoformat()
                  if captured_at is not None and item["date_text"] is None and item["date"] is None else item["date"]}
                 for item in result["transactions"]
             ], "issues": [issue for issue in result["issues"] if issue != "missing_date" or captured_at is None]}
@@ -126,16 +138,19 @@ def _prepare_entries(db: sqlite3.Connection, digest: str, result: dict) -> None:
         ])
 
 
-def _payload(entry: dict, result: dict, cash_account_id: str, external_id: str) -> dict:
+def _payload(entry: dict, result: dict, cash_account_id: str, external_id: str, classification: dict) -> dict:
     transaction = {
         "type": "withdrawal" if entry["type"] == "expense" else "deposit",
         "amount": entry["amount"], "currency_code": "USD", "date": entry["date"],
         "description": entry["description"], "external_id": external_id,
-        "category_name": entry.get("category", FALLBACK_CATEGORY),
         "tags": ["needs-review"], "reconciled": False,
         "notes": "Imported by FiMA; review against the original recording.\n"
                  "External ID: " + external_id + "\n\nOriginal transcript:\n" + result["transcript"],
     }
+    if classification["category"] is not None:
+        transaction["category_id"] = classification["category"]["id"]
+    if classification["budget"] is not None:
+        transaction["budget_id"] = classification["budget"]["id"]
     if entry["type"] == "expense":
         transaction.update(source_id=cash_account_id, destination_name="FiMA expenses")
     else:
@@ -150,7 +165,7 @@ def process_and_post(
     data_dir: Path = DEFAULT_DATA_DIR,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
-    """Save proposals before importing; resume without rerunning AI or edits.
+    """Save extracted facts, then classify and save choices before new writes.
 
     Content hashes identify duplicate files, not similar spoken purchases.
     Uncertain POSTs are only adopted when found; an absent search result never
@@ -189,7 +204,7 @@ def process_and_post(
                                (digest, timestamp, str(Path(model_path).expanduser().resolve()), json.dumps(result)))
                     _prepare_entries(db, digest, result)
             else:
-                report("Using the saved proposal and import progress; AI will not run again.")
+                report("Using saved extraction and import progress; transaction facts will not be extracted again.")
                 original = json.loads(saved["result"])
                 result = _validate_result(original, captured_at, allow_defaults=not attempted, legacy_categories=True)
                 if result != original:
@@ -197,17 +212,43 @@ def process_and_post(
                         db.execute("UPDATE recordings SET result = ? WHERE audio_sha256 = ?",
                                    (json.dumps(result), digest))
                         _prepare_entries(db, digest, result)
-                    report("Applied missing date/category defaults to saved, unattempted entries.")
+                    report("Applied missing date defaults to saved, unattempted entries.")
+
+            classifications = {}
+            for row in db.execute("SELECT ordinal, result FROM classifications WHERE audio_sha256 = ?", (digest,)):
+                ordinal = row["ordinal"]
+                if type(ordinal) is not int or not 0 <= ordinal < len(result["transactions"]):
+                    raise ImportingError("Invalid saved classification index; preserve the import journal.")
+                classifications[ordinal] = validate_classification(json.loads(row["result"]), result["transactions"][ordinal])
 
             def summary(status: str, url: str | None = None) -> dict:
+                legacy_budgets = None
+                if saved is not None and "budget_assignments" in saved.keys() and saved["budget_assignments"] is not None:
+                    legacy_budgets = json.loads(saved["budget_assignments"])
+                    if not isinstance(legacy_budgets, list) or len(legacy_budgets) != len(result["transactions"]):
+                        raise ImportingError("Invalid legacy budget snapshot; preserve the import journal.")
                 entries = [dict(row) for row in db.execute(
                     "SELECT ordinal + 1 AS entry, external_id, status, firefly_id FROM entries "
                     "WHERE audio_sha256 = ? ORDER BY ordinal", (digest,),
                 )]
                 for entry in entries:
+                    classification = classifications.get(entry["entry"] - 1)
+                    if classification is not None:
+                        entry.update({kind + "_id": reference["id"] if reference else None
+                                      for kind, reference in classification.items()})
+                        entry.update({kind + "_name": reference["name"] if reference else None
+                                      for kind, reference in classification.items()})
+                    elif legacy_budgets is not None and entry["status"] != "pending":
+                        budget = legacy_budgets[entry["entry"] - 1]
+                        validate_classification({"category": None, "budget": budget}, result["transactions"][entry["entry"] - 1])
+                        entry.update(budget_id=budget["id"] if budget else None, budget_name=budget["name"] if budget else None)
                     if entry["firefly_id"] and url:
                         entry["url"] = url + "/transactions/show/" + entry["firefly_id"]
-                return {**result, "import": {"recording_id": digest, "status": status,
+                transactions = [{**transaction, **{
+                    kind: reference["name"] if reference else None
+                    for kind, reference in classifications.get(index, {}).items()
+                }} for index, transaction in enumerate(result["transactions"])]
+                return {**result, "transactions": transactions, "import": {"recording_id": digest, "status": status,
                         "journal": str(directory / "imports.sqlite3"), "entries": entries}}
 
             if not result["transactions"] or result["issues"]:
@@ -230,6 +271,7 @@ def process_and_post(
                 db.execute("UPDATE recordings SET firefly_url = ?, cash_account_id = ? WHERE audio_sha256 = ?",
                            (client.url, cash_account_id, digest))
 
+            catalog = None
             for entry in entries:
                 if entry["status"] == "posted":
                     continue
@@ -240,7 +282,44 @@ def process_and_post(
                         raise ImportingError("Cannot confirm the earlier POST for " + external_id + ". "
                                              "Inspect Firefly before any manual recovery; automatic reposting is disabled. "
                                              "Progress is saved in " + str(directory / "imports.sqlite3"))
-                    payload = _payload(result["transactions"][ordinal], result, cash_account_id, external_id)
+                    if catalog is None:
+                        report("Discovering Firefly categories and active budgets...")
+                        catalog = load_catalog(client)
+                    if ordinal not in classifications:
+                        pending = [row["ordinal"] for row in db.execute(
+                            "SELECT ordinal FROM entries WHERE audio_sha256 = ? AND status = 'pending' ORDER BY ordinal",
+                            (digest,),
+                        ) if row["ordinal"] not in classifications]
+                        facts = [result["transactions"][index] for index in pending]
+                        report("Classifying extracted transactions using the Firefly catalog...")
+                        choices = classify_with_model(facts, catalog, model_path=model_path)
+                        if not isinstance(choices, list) or len(choices) != len(pending):
+                            raise ClassificationError("Incomplete classifications; no new write was attempted.")
+                        for index, choice in zip(pending, choices):
+                            validate_classification(choice, result["transactions"][index])
+                            for kind, reference in choice.items():
+                                plural = "categories" if kind == "category" else "budgets"
+                                if reference is not None and reference not in catalog[plural]:
+                                    raise ClassificationError("Classification used a reference outside the discovered catalog.")
+                        with db:
+                            db.executemany("INSERT INTO classifications VALUES (?, ?, ?)", [
+                                (digest, index, json.dumps(choice)) for index, choice in zip(pending, choices)
+                            ])
+                        classifications.update(zip(pending, choices))
+                    classification = classifications[ordinal]
+                    current = {}
+                    for kind, reference in classification.items():
+                        plural = "categories" if kind == "category" else "budgets"
+                        current[kind] = next((item for item in catalog[plural] if reference is not None and item["id"] == reference["id"]), None)
+                        if reference is not None and current[kind] is None:
+                            raise ImportingError(f"The saved {kind} is missing or inactive; restore it before resuming this entry.")
+                    if current["budget"] is not None and not budget_fits_category(current["budget"], current["category"]):
+                        classification = {**classification, "budget": None}
+                        with db:
+                            db.execute("UPDATE classifications SET result = ? WHERE audio_sha256 = ? AND ordinal = ?",
+                                       (json.dumps(classification), digest, ordinal))
+                        classifications[ordinal] = classification
+                    payload = _payload(result["transactions"][ordinal], result, cash_account_id, external_id, classification)
                     # Commit BEFORE calling the server. Ctrl+C, process death, or
                     # a local commit failure after POST all leave a recoverable marker.
                     with db:
