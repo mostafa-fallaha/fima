@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from fima.categories import FALLBACK_CATEGORY
 from fima.extraction import ExtractionError, TRANSACTION_SCHEMA, validate_proposal
 from fima.firefly import DEFAULT_DATA_DIR, FireflyError, load_firefly, transaction_id
 from fima.processing import DEFAULT_MODEL_PATH, process_audio
@@ -75,7 +76,8 @@ def _journal(data_dir: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _validate_result(
-    result: dict, captured_at: datetime | None, *, allow_date_default: bool = False,
+    result: dict, captured_at: datetime | None, *, allow_defaults: bool = False,
+    legacy_categories: bool = False,
 ) -> dict:
     """Revalidate saved/generated proposals at the ledger boundary."""
     try:
@@ -84,23 +86,31 @@ def _validate_result(
             raise ValueError
         transactions = []
         for item in result["transactions"]:
-            if set(item) != set(TRANSACTION_SCHEMA["required"]) | {"date"}:
+            required = set(TRANSACTION_SCHEMA["required"]) | {"date"}
+            if set(item) != required and not (legacy_categories and set(item) == required - {"category"}):
                 raise ValueError
-            transactions.append({key: item[key] for key in TRANSACTION_SCHEMA["required"]})
+            transactions.append({key: item.get(key) for key in TRANSACTION_SCHEMA["required"]})
         checked = {"transcript": transcript, **validate_proposal(
             {"transactions": transactions, "issues": result["issues"]},
             transcript, captured_at=captured_at,
         )}
+        if legacy_categories and not allow_defaults:
+            # A legacy attempted entry may already exist without a category in
+            # Firefly. Keep that original snapshot; don't imply it was updated.
+            for original, item in zip(result["transactions"], checked["transactions"]):
+                if "category" not in original:
+                    item.pop("category")
         if checked != result:
-            if not allow_date_default or captured_at is None:
+            if not allow_defaults:
                 raise ValueError
-            # Upgrade only the omitted dates from the old policy. All source
-            # fields, other dates and non-date issues must still match exactly.
+            # Upgrade only omitted dates/categories from the earlier policies.
+            # Keep all other facts and unrelated issue flags unchanged.
             upgraded = {**result, "transactions": [
-                {**item, "date": captured_at.date().isoformat()}
-                if item["date_text"] is None and item["date"] is None else item
+                {**item, "category": item.get("category", FALLBACK_CATEGORY),
+                 "date": captured_at.date().isoformat()
+                 if captured_at is not None and item["date_text"] is None and item["date"] is None else item["date"]}
                 for item in result["transactions"]
-            ], "issues": [issue for issue in result["issues"] if issue != "missing_date"]}
+            ], "issues": [issue for issue in result["issues"] if issue != "missing_date" or captured_at is None]}
             if checked != upgraded:
                 raise ValueError
         return checked
@@ -121,6 +131,7 @@ def _payload(entry: dict, result: dict, cash_account_id: str, external_id: str) 
         "type": "withdrawal" if entry["type"] == "expense" else "deposit",
         "amount": entry["amount"], "currency_code": "USD", "date": entry["date"],
         "description": entry["description"], "external_id": external_id,
+        "category_name": entry.get("category", FALLBACK_CATEGORY),
         "tags": ["needs-review"], "reconciled": False,
         "notes": "Imported by FiMA; review against the original recording.\n"
                  "External ID: " + external_id + "\n\nOriginal transcript:\n" + result["transcript"],
@@ -180,13 +191,13 @@ def process_and_post(
             else:
                 report("Using the saved proposal and import progress; AI will not run again.")
                 original = json.loads(saved["result"])
-                result = _validate_result(original, captured_at, allow_date_default=not attempted)
+                result = _validate_result(original, captured_at, allow_defaults=not attempted, legacy_categories=True)
                 if result != original:
                     with db:
                         db.execute("UPDATE recordings SET result = ? WHERE audio_sha256 = ?",
                                    (json.dumps(result), digest))
                         _prepare_entries(db, digest, result)
-                    report("Applied the capture-date default to saved, unattempted entries.")
+                    report("Applied missing date/category defaults to saved, unattempted entries.")
 
             def summary(status: str, url: str | None = None) -> dict:
                 entries = [dict(row) for row in db.execute(

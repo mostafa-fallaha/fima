@@ -15,8 +15,17 @@ CATEGORY_GROUPS = {
     "Housing": ("Rent", "Utilities", "Home Supplies"),
     "Finance": ("Fees & Charges", "Investments"),
     "Income": ("Salary", "Other Income"),
-    "Other": ("Gifts", "Miscellaneous"),
+    "Other": ("Gifts", "Miscellaneous", "Others"),
 }
+
+FALLBACK_CATEGORY = "Others"
+CATEGORY_NAMES = tuple(name for names in CATEGORY_GROUPS.values() for name in names)
+_CATEGORY_LOOKUP = {name.casefold(): name for name in CATEGORY_NAMES}
+
+
+def normalize_category(value: str | None) -> str:
+    """Use only the configured names; unassigned/unknown labels become Others."""
+    return _CATEGORY_LOOKUP.get(value.strip().casefold(), FALLBACK_CATEGORY) if value else FALLBACK_CATEGORY
 
 
 def _category(data: dict) -> dict:

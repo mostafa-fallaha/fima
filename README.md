@@ -102,7 +102,7 @@ Use the same project directory so the relative model cache can be found.
 - `src/fima/firefly.py` configures a local Firefly API connection, searches import
   external IDs, and creates one fictional connection-test transaction.
 - `src/fima/categories.py` creates the initial category list on explicit setup,
-  preserving existing categories.
+  preserving existing categories, and defines allowed names and the `Others` fallback.
 - `src/fima/importing.py` saves recording results and per-entry posting progress
   in SQLite, holds unresolved recordings, and imports complete entries for review.
 - `evals/` contains 20 fabricated transcripts and a model-comparison runner.
@@ -164,8 +164,9 @@ uv run --offline fima extract "I bought chicken for 10 dollars."
 The default GGUF is `~/models/gemma_4_e2b/gemma-4-E2B-it-UD-Q8_K_XL.gguf`.
 To select another local model, pass `--model-path /path/to/model.gguf`.
 
-The JSON result contains an expense for `"10.00"` USD, a description, its exact
-source quote, `date: null`, and a `missing_date` review issue. All successful
+The JSON result contains an expense for `"10.00"` USD, a description, a proposed
+category such as `Groceries`, its exact source quote, `date: null`, and a
+`missing_date` review issue. All successful
 results include `requires_review: true`. `extract` and ordinary `process` return
 proposals. `process --post` saves results and imports eligible entries for review
 (section 9). Section 8 tests the connection with a separate fictional transaction.
@@ -201,12 +202,17 @@ Amounts are decimal strings checked with `Decimal`, never binary floating point.
 Missing amounts stay null. Explicit foreign currencies stay visible and are
 flagged as unsupported, without conversion. Transfers and ambiguous incoming
 money are flagged. Correction utterances create no new transactions in this
-initial version. Accounts, categories, posting, and correction application are
-future components.
+initial version. The model also chooses a category for each transaction from the
+24 names in section 8, so one recording may contain several categories. It uses
+`Others` when it cannot assign a category confidently. Python canonicalizes known
+names and defaults missing, null, empty or unrecognized labels to `Others`.
+Category uncertainty alone adds no blocking issue; other financial ambiguity
+still holds the recording. Account extraction and correction application remain
+future components; `process --post` handles posting as described in section 9.
 
 Validation checks structure and some financial constraints; it cannot establish
 that the model understood the transcript correctly. Check the source quote,
-amount, type, currency and description before accepting any proposal.
+amount, type, currency, category and description when reviewing a proposal.
 
 ## 7. Process a recording in one command
 
@@ -349,7 +355,7 @@ Run this once after configuring Firefly:
 uv run --offline fima firefly setup-categories
 ```
 
-The command creates the 23 categories below. Category setup is explicit so you
+The command creates the 24 categories below. Category setup is explicit so you
 control when this initial list is added. Repeating the command creates only
 missing names; matching ignores case and surrounding whitespace. Existing
 categories, their notes and unrelated categories are preserved. The JSON result
@@ -366,7 +372,7 @@ directory, use `fima firefly --data-dir PATH setup-categories`.
 | Housing | Rent, Utilities, Home Supplies |
 | Finance | Fees & Charges, Investments |
 | Income | Salary, Other Income |
-| Other | Gifts, Miscellaneous |
+| Other | Gifts, Miscellaneous, Others |
 
 [Firefly 6.7.9's category API](https://github.com/firefly-iii/firefly-iii/blob/v6.7.9/app/Api/V1/Requests/Models/Category/StoreRequest.php)
 has no parent-group field. These are flat categories with the exact names above;
@@ -377,8 +383,9 @@ Firefly hierarchy. Existing category notes are left as you set them.
 The complete existing category list is checked before any creation. On a failed
 or interrupted creation, earlier categories may already exist; repeat the command
 to check existing names before continuing. POSTs are not automatically retried.
-This sets up the list; assigning categories to extracted transactions is a later
-component. Category setup does not run during ordinary recording processing.
+Rerun setup if you created the earlier 23-category list; it adds `Others` while
+preserving existing categories. Normal extraction classifies each transaction
+using this list. The full category setup does not run during recording processing.
 
 ## 9. Import a recording into Firefly
 
@@ -410,7 +417,10 @@ account named `FiMA expenses`. Income becomes deposits from a revenue account
 named `FiMA income` into the same cash account. Firefly creates those counterpart
 accounts as needed. Entries have `needs-review`, the original transcript in notes,
 and `reconciled: false`; Firefly rules and webhooks are disabled for these writes.
-Review amounts, dates and meaning in Firefly, correct/delete entries as needed,
+FiMA sends each validated category name through Firefly's
+[`category_name` transaction field](https://github.com/firefly-iii/firefly-iii/blob/v6.7.9/app/Api/V1/Requests/Models/Transaction/StoreRequest.php).
+Unclassified transactions use the exact category name `Others`.
+Review amounts, dates, categories and meaning in Firefly, correct/delete entries as needed,
 then remove `needs-review`. These are real entries and affect balances immediately.
 Validation checks structure and basic rules; it cannot prove the spoken facts.
 
@@ -432,6 +442,14 @@ no import has been attempted: omitted dates use the saved capture timestamp,
 the resolved `missing_date` flag is cleared, and all other issues are retained.
 This reuses the saved transcript/proposal without rerunning AI. Posted or
 uncertain results are never changed by this migration.
+
+Saved, unattempted proposals created before categories were supported receive
+`category: "Others"` without rerunning AI or changing other financial fields.
+New model runs classify each transaction. Already-posted legacy entries retain
+their original snapshot and Firefly category; reruns never overwrite user edits.
+Legacy uncertain writes still require reconciliation, and remaining entries of
+a legacy partial import use `Others` when they have no saved category. Use a new
+recording to test the updated model; resetting a test journal is described below.
 
 For a clean test run, reset the local journal from the project directory:
 
@@ -460,15 +478,17 @@ guarantee across lost journals, separate data directories or external-ID edits.
 
 Gemma remains the default; `--model-path` selects Qwen or another local GGUF for
 a new recording. Saved development scores below are 15/20 for Gemma and 19/20
-for Qwen under the earlier date policy. Two fixture expectations now use the
-capture-date default, so the saved reports have different fixture hashes; no
-new model scores have been measured. No live Firefly write was performed to
-verify this change.
+for Qwen under the earlier date policy and without categorization. Prompt/schema
+and fixture expectations now include categories, so those saved reports do not
+measure the current behavior. Four fabricated real-Gemma category checks passed:
+snacks, salary, the `Others` fallback, and two transactions with different categories.
+The 20-case evaluation has not been rerun. No live Firefly write was performed
+to verify this change.
 
 ## Current validation status
 
 As of 2026-11-05, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 162 standard-library tests passed
+complete large-v3 weights are present. All 174 standard-library tests passed
 using the project interpreter, including category setup and the reset helper.
 These include extraction validation, client error
 handling, CLI behavior, automatic CUDA library loading, evaluation scoring,
@@ -483,7 +503,11 @@ migration and protection of attempted entries. The full suite needs permission t
 socket; it requires no model, GPU, or live Firefly installation.
 Category tests check the requested names/notes, existing-category preservation,
 pagination, failures and reruns after a lost response. Category setup was tested
-with API stand-ins; no live categories were created during verification.
+with API stand-ins; no live categories were created during verification. Extraction
+tests cover known names, `Others` fallbacks and separate categories per transaction.
+Import tests verify category mapping over HTTP, saved-result compatibility and
+preservation of already-posted entries. Four actual Gemma checks used fabricated
+text only, with no private audio or Firefly requests; the owned server was stopped.
 Current ignore rules exclude test/evaluation source and fabricated cases from Git;
 the checks above exist locally. Generated reports, recordings, models, credentials
 and journals stay ignored.
