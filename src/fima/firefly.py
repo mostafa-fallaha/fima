@@ -15,12 +15,23 @@ class FireflyError(Exception):
     """A Firefly connection or configuration problem suitable for CLI output."""
 
 
+class FireflyUnavailableError(FireflyError):
+    """The local HTTP connection could not be completed."""
+
+
+class FireflyHTTPError(FireflyError):
+    def __init__(self, status: int):
+        self.status = status
+        advice = "Check the personal access token." if status in {401, 403} else "Check the Firefly server and account setup."
+        super().__init__(f"Firefly returned HTTP {status}. {advice}")
+
+
 DEFAULT_URL = "http://127.0.0.1:8088"
 DEFAULT_DATA_DIR = Path("data")
 
 
 class FireflyClient:
-    def __init__(self, url: str, token: str):
+    def __init__(self, url: str, token: str, *, timeout: float = 20):
         if not isinstance(url, str):
             raise FireflyError("Firefly URL must be a local HTTP URL.")
         try:
@@ -40,9 +51,10 @@ class FireflyClient:
             raise FireflyError("A Firefly personal access token is required (without whitespace).")
         self.url = url.rstrip("/")
         self.host, self.port, self.token = parsed.hostname, port, token
+        self.timeout = timeout
 
     def request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        connection = HTTPConnection(self.host, self.port, timeout=20)
+        connection = HTTPConnection(self.host, self.port, timeout=self.timeout)
         headers = {"Accept": "application/json", "Authorization": "Bearer " + self.token}
         body = None
         if payload is not None:
@@ -52,8 +64,7 @@ class FireflyClient:
             connection.request(method, "/api/v1" + path, body=body, headers=headers)
             response = connection.getresponse()
             if response.status not in {200, 201}:
-                advice = "Check the personal access token." if response.status in {401, 403} else "Check the Firefly server and account setup."
-                raise FireflyError(f"Firefly returned HTTP {response.status}. {advice}")
+                raise FireflyHTTPError(response.status)
             raw = response.read(1_048_577)
             if len(raw) > 1_048_576:
                 raise FireflyError("Firefly response exceeded 1 MiB.")
@@ -63,7 +74,7 @@ class FireflyClient:
             return result
         except (OSError, HTTPException) as error:
             # Do not echo request details or the token, and never retry a POST.
-            raise FireflyError("Cannot complete the local Firefly request. Check that Firefly is running.") from error
+            raise FireflyUnavailableError("Cannot complete the local Firefly request. Check that Firefly is running.") from error
         except (ValueError, UnicodeError) as error:
             raise FireflyError("Firefly returned an invalid JSON response.") from error
         finally:

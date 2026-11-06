@@ -102,6 +102,8 @@ Use the same project directory so the relative model cache can be found.
   extraction and evaluations, and runs transcription in a separate child process.
 - `src/fima/firefly.py` configures a local Firefly API connection, searches import
   external IDs, and creates one fictional connection-test transaction.
+- `src/fima/firefly_runtime.py` checks the API before AI work and starts FiMA's
+  local Compose stack when needed, leaving Firefly running for review.
 - `src/fima/categories.py` creates the initial category list on explicit setup,
   preserving existing categories, and discovers the user's actual category list.
 - `src/fima/classification.py` discovers active budgets and classifies each
@@ -286,8 +288,8 @@ with Firefly 6.7.9, MariaDB LTS, persistent database/upload volumes, and the web
 port bound to `127.0.0.1:8088`. It uses English and Asia/Beirut time. Scheduled
 jobs can be added when recurring transactions are needed.
 
-This Arch setup uses the system Docker engine and Compose plugin. If needed,
-install the plugin and start the engine in your terminal:
+This Arch setup uses the system Docker engine and Compose plugin. For initial
+setup, install the plugin and start the engine:
 
 ```bash
 sudo pacman -S docker-compose
@@ -302,7 +304,10 @@ sudo docker --context default compose -f deploy/firefly/compose.yaml up -d
 ```
 
 The explicit `default` context uses the system Docker engine, avoiding this PC's
-inactive Docker Desktop context. The setup script creates ignored
+inactive Docker Desktop context. This manual launch is for initial registration
+and token setup; subsequent `process --post` runs manage container startup.
+Start Docker yourself with `sudo systemctl start docker` when it is stopped.
+The setup script creates ignored
 `deploy/firefly/.env` secrets with mode 0600 and preserves an existing file.
 Keep those secrets with database backups. The first Docker image pull requires
 internet access and can take time. After migrations finish, open
@@ -326,6 +331,15 @@ The token is saved in ignored `data/firefly.json` with mode 0600, so you do not
 need to export it in each terminal. It is never printed. Requests go directly to
 loopback, without HTTP proxies or redirects. A failed configuration check
 preserves the previous configuration.
+
+For automatic container startup, FiMA first tries Docker as your current user.
+If the socket reports permission denied, it tries cached `sudo -n` authorization.
+If that authorization has expired, run `sudo -v` in the same terminal and repeat
+the FiMA command. It never prompts for a password inside a background subprocess
+or runs the full application as root. Persistent Docker access can be configured
+once using the [Docker non-root setup guide](https://docs.docker.com/engine/install/linux-postinstall/).
+FiMA does not manage the Docker service, change user groups or enable services
+at boot. Start Docker manually before importing when it is stopped.
 
 `smoke-test` creates **one real ledger entry** for $0.01, labelled
 **FiMA connection test — delete after verifying**, with `needs-review` and
@@ -407,6 +421,28 @@ uv run --offline fima process /path/to/recording.mp3 --offline --post \
     --captured-at 2026-11-05T12:00:00+02:00
 ```
 
+Before a new recording runs any AI, FiMA verifies the saved Firefly connection,
+token and active USD cash account. If Firefly is unreachable at the managed
+`127.0.0.1:8088` endpoint (`localhost:8088` also works), it brings up this
+checkout's `fima-firefly` Compose project in the system `default` Docker context.
+Docker must already be running; if it is unavailable, FiMA asks you to run
+`sudo systemctl start docker` and retry.
+It preserves existing containers/volumes and secrets, does not pull images, and
+waits for actual authenticated API readiness with a 120-second startup budget.
+Container startup is limited to 60 seconds within that budget. Firefly stays
+running after completion or interruption so you can review entries.
+
+An already responding API needs no Docker access or deployment files. HTTP 5xx
+responses are retried while that service starts; authentication/account failures
+and invalid responses stop immediately. An unavailable custom endpoint is never
+replaced with FiMA's default stack. Missing Docker/Compose, engine access, images
+or initial setup produces a readable error before inference. Complete the
+one-time setup in section 8 first.
+
+Resuming saved pending work checks readiness before classification/posting.
+Cached held results and fully posted history can still be read without Firefly.
+Plain `process`, `extract` and `transcribe` keep their local-only behavior.
+
 Replace the example capture time with the recording's actual timestamp. An
 omitted date defaults to that timestamp's local calendar date. `Today`/`yesterday`
 are resolved relative to it; an explicit spoken YYYY-MM-DD date takes precedence
@@ -418,7 +454,7 @@ After transcription, FiMA runs two separate AI steps:
 
 1. **Extract facts:** transaction type, amount, currency, description, date phrase
    and exact source quote. Python validates the facts and resolves dates; the
-   transcript and extraction are saved before contacting Firefly.
+   transcript and extraction are saved before classification or ledger writes.
 2. **Classify:** discover the current Firefly categories and active budgets, then
    ask the local model to classify one transaction at a time. This step returns
    only `category` and `budget` names or null; it cannot change the extracted facts.
@@ -437,8 +473,9 @@ The second step starts its own temporary local server using the same
 `--model-path`; all per-transaction classification requests share that server.
 It stops on success, failure or Ctrl+C. No new models or dependencies are needed.
 
-FiMA saves the transcript, validated facts and capture/model metadata before
-contacting Firefly. Only a nonempty proposal with **no issues** can be imported.
+After the initial readiness GETs, FiMA saves the transcript, validated facts and
+capture/model metadata before classification or transaction creation. Only a
+nonempty proposal with **no issues** can be imported.
 Any missing/ambiguous field, unsupported currency, transfer, correction or other
 issue holds the entire recording locally, including its complete entries.
 The JSON result adds `import.status` (`held` or `posted`), `recording_id`, the
@@ -528,8 +565,8 @@ No live Firefly write was performed to verify this change.
 
 ## Current validation status
 
-As of 2026-11-05, Python 3.12.13, the inference dependencies, `uv.lock`, and the
-complete large-v3 weights are present. All 199 standard-library tests passed
+As of 2026-11-06, Python 3.12.13, the inference dependencies, `uv.lock`, and the
+complete large-v3 weights are present. All 222 standard-library tests passed
 using the project interpreter, including two-stage classification and recovery.
 These include extraction validation, client error
 handling, CLI behavior, automatic CUDA library loading, evaluation scoring,
@@ -551,6 +588,14 @@ invalid outputs and immutable facts. Import tests verify saved facts before
 classification, saved choices before POST, retries, ID mapping over HTTP,
 legacy snapshots and preservation of posted entries. The reset helper also
 clears classifications through their entry relationship.
+Startup tests cover ready/stopped stacks, manual Docker-start guidance,
+authentication/account failures, custom endpoint protection, bounded waits,
+cached-sudo authorization, secret redaction and CLI child cleanup.
+Docker/API stand-ins verify container startup and that an unavailable engine
+does not trigger service management. On 2026-11-06,
+the live preflight reused Firefly 6.7.9 and verified the saved USD account through
+GET requests only. The running stack was not stopped or recreated for testing;
+no live journal changes, private audio or ledger writes were involved.
 Live GET discovery found 24 categories and two active budgets. Four fabricated
 real-Gemma scenarios passed the final two-stage flow: salary/gold/petrol,
 groceries, restaurant lunch and investment shares. Gold/shares used Investments

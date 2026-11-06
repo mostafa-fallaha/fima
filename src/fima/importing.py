@@ -16,6 +16,7 @@ from fima.classification import (
 )
 from fima.extraction import ExtractionError, TRANSACTION_SCHEMA, validate_proposal
 from fima.firefly import DEFAULT_DATA_DIR, FireflyError, load_firefly, transaction_id
+from fima.firefly_runtime import ensure_firefly
 from fima.processing import DEFAULT_MODEL_PATH, process_audio
 
 
@@ -191,6 +192,8 @@ def process_and_post(
                 # Held/unattempted recordings may be resolved with capture metadata.
                 saved = None
             if saved is None:
+                preflight = load_firefly(directory)
+                ensure_firefly(*preflight, progress=report)
                 result = _validate_result(process_audio(
                     audio, offline=offline, model_path=model_path,
                     captured_at=captured_at, progress=report,
@@ -204,6 +207,7 @@ def process_and_post(
                                (digest, timestamp, str(Path(model_path).expanduser().resolve()), json.dumps(result)))
                     _prepare_entries(db, digest, result)
             else:
+                preflight = None
                 report("Using saved extraction and import progress; transaction facts will not be extracted again.")
                 original = json.loads(saved["result"])
                 result = _validate_result(original, captured_at, allow_defaults=not attempted, legacy_categories=True)
@@ -262,11 +266,12 @@ def process_and_post(
             if all(entry["status"] == "posted" for entry in entries):
                 return summary("posted", saved["firefly_url"])
 
-            client, cash_account_id = load_firefly(directory)
+            client, cash_account_id = preflight if preflight is not None else load_firefly(directory)
             if saved["firefly_url"] is not None and (saved["firefly_url"], saved["cash_account_id"]) != (client.url, cash_account_id):
                 raise ImportingError("The saved Firefly destination differs from the current configuration. "
                                      "Restore the original URL/account before resuming this recording.")
-            client.check(cash_account_id)
+            if preflight is None:
+                ensure_firefly(client, cash_account_id, progress=report)
             with db:
                 db.execute("UPDATE recordings SET firefly_url = ?, cash_account_id = ? WHERE audio_sha256 = ?",
                            (client.url, cash_account_id, digest))
